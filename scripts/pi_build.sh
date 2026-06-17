@@ -6,7 +6,7 @@
 #
 # Requires: aarch64-linux-gnu-g++/gcc (apt install g++-aarch64-linux-gnu), cmake.
 # ABI: built with GCC 11 -> needs glibc<=2.36 / GLIBCXX<=3.4.30 == Raspberry Pi OS *bookworm*.
-#      On an OLDER Pi OS (bullseye), build natively on the Pi instead (see PI_RUNBOOK.md).
+#      On an OLDER Pi OS (bullseye), build natively on the Pi instead.
 # ============================================================================
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

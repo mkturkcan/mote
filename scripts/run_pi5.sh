@@ -14,10 +14,10 @@
 # ============================================================================
 set -euo pipefail
 
-MODELS=${MODELS:-$HOME/cpullm/models}
+MODELS=${MODELS:-$HOME/mote/models}
 DRAFT=${DRAFT:-$MODELS/mtp-gemma-4-E2B-it.gguf}        # MTP head, 94MB
 # BIN: the deployed package (scripts/pi_deploy.sh puts the binary + project .so here).
-BIN=${BIN:-$HOME/cpullm/bin/llama-server}
+BIN=${BIN:-$HOME/mote/bin/llama-server}
 PORT=${PORT:-8080}
 
 # TARGET: prefer Q4_K_M (A76-fast, BW-bound; see §QUANT), but fall back to whatever quant is actually present
@@ -59,7 +59,7 @@ esac
 # SAME target weight-read, committing whichever chain the target accepts further. It is LOSSLESS (63-agent
 # adversarial review found no correctness/KV bug; every committed token is the in-batch target argmax,
 # verified identical-to-MTP divergence). MEASURED gain: +8.7% tokens-per-pass, +17% acceptance (dev box,
-# hardware-independent). Roofline projects +4-8% Pi tok/s on top of MTP (scripts/tree_roofline.py) because
+# hardware-independent). Roofline projects +4-8% Pi tok/s on top of MTP because
 # the target weight-read dominates each pass and the branch rows hide under it (avg verify M < A76 crossover).
 #   *** This is a PREDICTION — confirm on real Pi5 silicon. *** On compute-rich/fast-memory hosts (dev box)
 #   it REGRESSES (-23%) because the per-pass overhead dominates a cheap read; the Pi inverts that economics.
@@ -143,7 +143,7 @@ print_overclock_hint() {
 EOF
 }
 
-# ---- §QUANT: pick for the A76 KERNEL, not just bytes (see PLAN.md §29) ----
+# ---- §QUANT: pick for the A76 KERNEL, not just bytes ----
 # COUNTERINTUITIVE (llvm-mca on real A76 kernels): fewer bytes != faster here.
 #   gemma-4-E2B-it-Q4_K_M.gguf  ~1383 MB/tok  *** RECOMMENDED *** has fast repacked
 #                                gemv kernel -> BANDWIDTH-bound -> scales with BW/overclock.
@@ -151,10 +151,10 @@ EOF
 #   gemma-4-E2B-it-Q3_K_M.gguf  ~1172 MB/tok  AVOID on A76: no repacked kernel -> COMPUTE-bound
 #                                at ~7.8 GB/s, STUCK regardless of memory BW. ~32-86% SLOWER than Q4_K_M.
 # So default to Q4_K_M: more bytes but the A76 actually saturates the bus with it, and quality is
-# >= Q3_K_M. (2-bit/IQ2 are off the table: PLAN.md §27-28 prove they're too lossy for E2B.)
+# >= Q3_K_M. (2-bit/IQ2 are off the table: too lossy for E2B.)
 # Confirm decode tok/s on the real Pi (this is an llvm-mca prediction, very strong but model-based).
 #
-# EXPERIMENTAL (PLAN.md §35): a hand-written NEON+dotprod q3_K repacked gemv is now integrated
+# EXPERIMENTAL: a hand-written NEON+dotprod q3_K repacked gemv is now integrated
 # (arch/arm/repack.cpp, default-on for ARM+dotprod). q3_K is ~15% fewer bytes than Q4_K_M; the kernel
 # is bit-exact/lossless and *may* be BW-bound (~+18%) on the A76 -- but that hinges on the OoO core
 # hiding the in-kernel scale unpack, which only real Pi silicon can confirm (llvm-mca/QEMU can't).

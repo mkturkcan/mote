@@ -6,9 +6,9 @@
 #   gemma bench                        quick speed test
 #   gemma status | stop
 set -uo pipefail
-CPULLM="${CPULLM_HOME:-$HOME/cpullm}"
+MOTE="${MOTE_HOME:-$HOME/mote}"
 PORT="${PORT:-8080}"
-RUN="$CPULLM/scripts/run_pi5.sh"
+RUN="$MOTE/scripts/run_pi5.sh"
 myip(){ hostname -I 2>/dev/null | awk '{print $1}'; }
 up(){ curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
 
@@ -32,7 +32,7 @@ case "${1:-help}" in
   ui)     echo "open in any browser on your network:  http://$(myip):$PORT" ;;
   bench)
     up || { echo "not running — 'gemma start' first"; exit 1; }
-    HOST=127.0.0.1 python3 "$CPULLM/scripts/pi_bench.py" "$PORT" --suite general --n 64 ;;
+    HOST=127.0.0.1 python3 "$MOTE/scripts/pi_bench.py" "$PORT" --suite general --n 64 ;;
   chat)
     up || { echo "not running — 'gemma start' first"; exit 1; }
     echo "Gemma chat — type a message, Ctrl-C to quit."

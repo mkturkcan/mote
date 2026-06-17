@@ -6,16 +6,16 @@
 #
 #   bash scripts/install.sh
 #
-# Optional: set CPULLM_PKG_URL=<url-to-prebuilt-tarball> to skip the ~15 min native build.
+# Optional: set MOTE_PKG_URL=<url-to-prebuilt-tarball> to skip the ~15 min native build.
 # ============================================================================
 set -euo pipefail
 
-DEST="${CPULLM_HOME:-$HOME/cpullm}"
+DEST="${MOTE_HOME:-$HOME/mote}"
 JOBS="$(nproc)"
 HF="https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main"
 TARGET_GGUF="gemma-4-E2B-it-Q4_0.gguf"        # 2.9 GB target
 DRAFT_GGUF="mtp-gemma-4-E2B-it.gguf"          #  94 MB MTP draft head
-# repo root, if this script is being run from a checkout (not needed for the prebuilt CPULLM_PKG_URL path)
+# repo root, if this script is being run from a checkout (not needed for the prebuilt MOTE_PKG_URL path)
 SRC="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo /nonexistent)")/.." 2>/dev/null && pwd || echo /nonexistent)"
 
 say(){ printf "\n\033[1;34m[install]\033[0m %s\n" "$*"; }
@@ -28,16 +28,16 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq build-essential cmake git curl libgomp1
 
 say "2/5  the tuned server ..."
-if [ -n "${CPULLM_PKG_URL:-}" ]; then
+if [ -n "${MOTE_PKG_URL:-}" ]; then
   # prebuilt path — fully standalone (no repo needed): the tarball carries bin/ + scripts/
-  echo "  downloading prebuilt package: $CPULLM_PKG_URL"
-  tmp="$(mktemp -d)"; curl -fL --retry 3 "$CPULLM_PKG_URL" | tar -xz -C "$tmp"
+  echo "  downloading prebuilt package: $MOTE_PKG_URL"
+  tmp="$(mktemp -d)"; curl -fL --retry 3 "$MOTE_PKG_URL" | tar -xz -C "$tmp"
   cp "$tmp"/*/bin/llama-server "$tmp"/*/bin/*.so* "$DEST/bin/"
   cp "$tmp"/*/scripts/* "$DEST/scripts/" 2>/dev/null || true
   rm -rf "$tmp"
 else
   # source path — native build from the repo
-  [ -d "$SRC/third_party/llama.cpp" ] || { echo "ERROR: run from the cpullm repo, or set CPULLM_PKG_URL=<prebuilt tarball>"; exit 1; }
+  [ -d "$SRC/third_party/llama.cpp" ] || { echo "ERROR: run from the mote repo, or set MOTE_PKG_URL=<prebuilt tarball>"; exit 1; }
   echo "  building natively (KleidiAI + LTO, ~10-20 min on a Pi 5) ..."
   cmake -S "$SRC/third_party/llama.cpp" -B "$SRC/build-pi" \
     -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON \

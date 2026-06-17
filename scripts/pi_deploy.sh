@@ -6,16 +6,16 @@
 # Usage:
 #   PI_HOST=pi@192.168.1.50 ./scripts/pi_deploy.sh            # binary + scripts only (fast, ~19 MB)
 #   PI_HOST=pi@192.168.1.50 ./scripts/pi_deploy.sh --models   # also push *.gguf (slow, several GB; do once)
-#   PI_HOST=... PI_DIR=/home/pi/cpullm ./scripts/pi_deploy.sh # override remote dir (default ~/cpullm)
+#   PI_HOST=... PI_DIR=/home/pi/mote ./scripts/pi_deploy.sh # override remote dir (default ~/mote)
 #
-# On-Pi layout it creates:   ~/cpullm/{bin,scripts,models}
-# After deploy, on the Pi:   cd ~/cpullm/scripts && ./run_pi5.sh launch
+# On-Pi layout it creates:   ~/mote/{bin,scripts,models}
+# After deploy, on the Pi:   cd ~/mote/scripts && ./run_pi5.sh launch
 # ============================================================================
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/third_party/llama.cpp/build-a76/bin"
 PI_HOST="${PI_HOST:-${1:-}}"
-PI_DIR="${PI_DIR:-cpullm}"   # relative to the Pi user's home
+PI_DIR="${PI_DIR:-mote}"   # relative to the Pi user's home
 WITH_MODELS=0
 for a in "$@"; do [ "$a" = "--models" ] && WITH_MODELS=1; done
 

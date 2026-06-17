@@ -1,208 +1,233 @@
 # Mote
 
-*An open community project for running capable language models on small, common hardware: the Intelligence of Things. The Raspberry Pi 5 is the first target; the techniques carry to other Arm CPUs. Mote is independent and not affiliated with the developers of Gemma.*
+*An open community project for running capable language models on small, common hardware: the Intelligence
+of Things. The Raspberry Pi 5 is the first target; the techniques carry to other Arm CPUs. Mote is independent
+and not affiliated with the developers of Gemma.*
 
-Run Google's **Gemma‑4‑E2B**, an effective 2.3B‑parameter model, on a **Raspberry Pi 5** (BCM2712 /
-Cortex‑A76, 4 cores) at **9–18 tokens/sec** depending on workload and the quality mode you pick. The engine is
-`llama.cpp` driven by **MTP speculative decoding** (Gemma 4's first‑party draft head), tuned for the A76's
-memory system.
+Mote runs Google's **Gemma-4-E2B**, an effective 2.3B-parameter model, on a **Raspberry Pi 5** at **11 tokens
+per second** on general text and up to 20 on repetitive output, on four Arm Cortex-A76 cores with 8 GB of RAM
+and no accelerator. The engine is a tuned `llama.cpp` driven by Gemma's own multi-token-prediction head for
+speculative decoding, with hand-written A76 kernels and Arm KleidiAI underneath.
 
-Gemma‑4‑E2B keeps **2.3B effective** parameters and **5.1B** in total. The extra mass is a per‑layer embedding
-table read as a lookup rather than multiplied, so it streams from storage instead of occupying working memory.
-The text‑only GGUF here loads as about **4.65B** parameters: it still carries that table, with the vision and
-audio encoders stripped.
+## Quick start
 
-All numbers below are **measured on real Pi 5 silicon** (Q4_0 weights, 4 threads @ 2.4 GHz, pre‑throttle /
-active‑cooled). They are reproducible with `scripts/pi_bench.py`.
-
-## TL;DR, measured tok/s by mode and workload
-
-| `MODE=` | general (incl. prose) | structured (JSON/SQL/CSV/code) | literal (logs / repeated lines) | quality |
-|---|:---:|:---:|:---:|---|
-| **`quality`** (default) | **11.2** | 13.4 | 16.0 | **exact**, distribution‑faithful to the target |
-| **`fast`** | **12.5** | 13.9 | 17.2 | lossy, ~half the tokens drift from greedy |
-| **`turbo`** | 12.3 | 13.4 | **20.4** | lossy + n‑gram, built for repetitive output |
-
-> **vs just running the GGUF.** The *same* Q4_0 model in a stock GGUF library (`llama-cpp-python`, single‑stream,
-> no speculative decoding, what most people actually run) does **6.6 tok/s** on this Pi. This project's MTP
-> speculative decoding + A76 kernels + system tuning make it **1.7× faster on general text (11.2), 2.0× on
-> structured (13.4), and up to 2.4× on literal output (16.0)**, and `quality` mode stays distribution‑faithful,
-> so that speedup is *free of quality loss*. (The newest kernel work, `bf16` dot, `PAD`, KleidiAI, LTO, is the
-> last +20% of that climb, 9.4 → 11.2.) The naive PyTorch/`transformers` path is slower still, its fp16 weights
-> (~9 GB) don't even fit in the Pi's 8 GB RAM.
-
-## Install & run (Raspberry Pi OS, 64‑bit)
-
-From a clone of this repo, one command does everything, builds the tuned server, downloads the model (~3 GB),
-installs the `gemma` command, and tunes the system:
-
-```bash
-bash scripts/install.sh
-```
-
-Or, once a prebuilt package is attached to a GitHub release, a fresh Pi installs in seconds with no build (see
-[`docs/RELEASE.md`](docs/RELEASE.md)):
+On a Raspberry Pi 5 running 64-bit Raspberry Pi OS, one command installs a prebuilt server, downloads the
+model, and adds a `gemma` command. Nothing builds on the Pi.
 
 ```bash
 curl -fsSL https://github.com/mkturkcan/mote/releases/latest/download/install.sh \
-  | CPULLM_PKG_URL=https://github.com/mkturkcan/mote/releases/latest/download/gemma-pi5.tar.gz bash
+  | MOTE_PKG_URL=https://github.com/mkturkcan/mote/releases/latest/download/gemma-pi5.tar.gz bash
 ```
 
-Then it's one command to run and play with:
+Then:
 
 ```bash
-gemma start            # launch the server (lossless; also: gemma start fast | turbo)
+gemma start            # start the server (quality mode; also: gemma start fast | turbo)
 gemma chat             # chat in the terminal
-#  …or open  http://<pi-ip>:8080  in any browser for the built‑in web chat UI
-gemma bench            # quick speed test
+gemma bench            # measure tokens per second
 gemma stop
 ```
 
-Under the hood it's an OpenAI‑compatible server on `:8080` (`/completion`, `/v1/chat/completions`, web UI at `/`).
+Or open `http://<pi-ip>:8080` in any browser for the built-in chat UI. The server speaks the OpenAI API on
+port 8080. If `gemma` is not found right after install, run `source ~/.bashrc`.
+
+## Installation
+
+### Requirements
+
+- Raspberry Pi 5 (BCM2712, Cortex-A76), 8 GB recommended.
+- 64-bit Raspberry Pi OS, bookworm or newer (glibc 2.36 or later).
+- About 4 GB of free disk for the model files.
+
+### Prebuilt release (recommended)
+
+The Quick start command is the whole install. It fetches `install.sh` and a self-contained package from the
+latest GitHub release (the A76 `llama-server` binary, its shared libraries, and the launcher scripts),
+downloads the Q4_0 model and the draft head from Hugging Face, links a `gemma` command into `~/.local/bin`,
+and applies the CPU-governor and hugepage tuning. It is safe to re-run; finished steps are skipped. Everything
+lands in `~/mote`.
+
+### Build from source
+
+To compile the server on the Pi instead of using the prebuilt binary, clone the repo and run the installer
+with no package URL:
+
+```bash
+git clone https://github.com/mkturkcan/mote && cd mote
+bash scripts/install.sh
+```
+
+This builds `llama.cpp` with Arm KleidiAI, link-time optimization, and the A76 kernels in
+[`third_party/llama.cpp`](third_party/llama.cpp), which takes roughly 10 to 20 minutes on a Pi 5, then
+downloads the model and installs `gemma` as above.
+
+### Choosing a mode
+
+`gemma start` takes a mode:
+
+- **quality** (default). Every emitted token is a true argmax of the full model, so the output is the model's
+  own, just produced faster. Use it whenever the answer matters.
+- **fast**. Accepts draft tokens that are near the model's top choice rather than exactly it. About 17% faster
+  on general text at a real quality cost: on prose roughly half the tokens diverge from the greedy path. Good
+  for drafts and chat.
+- **turbo**. `fast` plus an n-gram drafter that replays long exact repeats from the context. Worth it only for
+  highly repetitive output such as logs or CSV, where it reaches the high teens. It slightly hurts prose and
+  structured output, so it is not a general default.
+
+### The gemma command
+
+```
+gemma start [quality|fast|turbo]   start the server
+gemma chat                         chat in the terminal
+gemma ui                           print the browser chat URL
+gemma bench                        measure throughput
+gemma status | stop
+```
+
 Power users can drive the launcher directly: `MODE=fast bash scripts/run_pi5.sh launch`.
 
-### Which mode?
+## Results
 
-- **`quality`** is the default. Output is **distribution‑exact**: every emitted token is a true argmax
-  of the full target model, so you get the model's real answer with **no quality loss**, just faster. Use this
-  for anything where the answer matters.
-- **`fast`**, trades quality for ~+17% on general text by accepting draft tokens that are *near* the target's
-  top choice (not exactly it). On prose roughly half the tokens diverge from the greedy path, so it reads
-  slightly differently and can drift on facts. Fine for drafts, chat, brainstorming.
-- **`turbo`**, `fast` plus an n‑gram drafter that replays long exact repeats straight from the context. Only
-  worth it when your output is **highly repetitive** (logs, CSV/JSON dumps, repeated boilerplate), where it hits
-  **15–18 tok/s**. It *slightly hurts* prose/structured output (the n‑gram displaces the stronger MTP draft), so
-  don't use it as a general default.
+Measured on a Raspberry Pi 5 with the Q4_0 weights and four threads at 2.4 GHz, active-cooled. Throughput is
+tokens per second; reproduce with `scripts/pi_bench.py`.
 
-## Why these numbers, and why 15 tok/s general is *not* reachable here
+| mode | general | structured | boilerplate |
+| --- | :---: | :---: | :---: |
+| stock GGUF, single-stream | 6.6 | 6.6 | 6.6 |
+| **quality** (default) | **11.2** | 13.4 | 16.0 |
+| fast | 12.5 | 13.9 | 17.2 |
+| turbo | 12.3 | 13.4 | 20.4 |
 
-CPU decode is **memory‑bandwidth bound**: each token streams the model's weights through RAM once, so
-`tok/s ≈ sustained_BW / bytes_per_token`. Speculative decoding is the one big lever, it **amortizes a single
-weight read over several emitted tokens** by drafting ahead with the tiny (94 MB) MTP head and verifying a batch
-against the full model.
+The baseline is the same Q4_0 model served by a stock GGUF library (`llama-cpp-python`, single-stream, no
+speculative decoding), which is what most people run. Mote's speculative decoding, A76 kernels, and system
+tuning make quality mode 1.7x faster on general text, 2.0x on structured output such as JSON and code, and 2.4x
+on repetitive output, and quality mode stays distribution-exact, so that speedup costs no quality. The naive
+PyTorch path is slower still; its fp16 weights do not fit in the Pi's 8 GB.
 
-Two hard walls cap general throughput on this device, and we measured both:
+Workloads: **general** includes prose, **structured** is JSON, SQL, CSV, and code, and **boilerplate** is logs
+and repeated lines.
 
-1. **The verify read is bandwidth‑bound.** Even an arm overclock doesn't help, the Pi 5's LPDDR4X timing is
-   fixed, and the weight read, not compute, dominates each pass. This sets the **pass rate** (~4.2 passes/s).
-2. **The draft can only predict so far.** Tokens/pass is `pass_rate × accepted_tokens`. The MTP draft's
-   2nd/3rd‑token accuracy is the ceiling: even accepting *every* near‑miss (heavy quality loss), tokens/pass
-   tops out at ~2.6 of a theoretical 4.0. That's ~11 tok/s general, **not 15.**
+## Configuration
 
-Reaching 15 tok/s general would need a structurally better draft or a smaller draft‑compatible target (the MTP
-head is Gemma‑4‑E2B‑specific, so you can't just swap in a smaller model). 15+ *is* reachable, but only on
-**literal/repetitive** output, which is what `turbo` targets, and the README reports those figures separately from the general number.
+`run_pi5.sh` reads these environment variables; the `MODE` presets set them for you.
 
-### The single biggest tuning insight: fill the 4‑row tile
-
-The active A76 GEMM kernel (`q4_0_4x4`) streams the weights **once per 4‑row tile**. The MTP verify batch is
-`M = 1 sampled + n_max drafted`. So **`n_max=3` → M=4 exactly fills one tile** = one weight read for 3 draft
-tokens. `n_max=4` → M=5 spills one row into a second gemv that **re‑streams the whole weight matrix** (+60 ms).
-Measured: n_max 2→6.3, **3→9.4**, 4→7.9, 7→7.7 tok/s. This single setting is +56% over the naive `n_max=10`.
-(`Q4_0` over `Q4_K_M` is a further +8%: its flat per‑32 scale dequant runs near the A76's sdot peak.)
-
-### Kernel work (A76-specific, all distribution-exact)
-
-Profiling a `quality`-mode pass (244 ms = 204 ms M=4 verify + ~40 ms for 3 MTP draft steps; verify is
-bandwidth-bound) found the engine was already near-optimal **except** where Gemma's MatFormer scaffolding hit
-*generic, unvectorized* kernels on the A76. The wins:
-
-- **ARM-NEON `bf16` dot product** (`ggml_vec_dot_bf16`). `llama.cpp` had AVX-512/AVX2/POWER paths but **no NEON
-  one**, and the A76 has no BF16 dot extension, so the 27.5 MB `per_layer_model_proj` (read every pass) ran a
-  fully *scalar* loop. The NEON path mirrors the AVX2 arithmetic exactly (`vshll_n_u16` for the exact bf16→f32
-  upconvert, multiply-then-add, f32 accumulate). **Result: ~16 ms/pass saved → +5% general, +9% structured, +19%
-  literal.** Distribution-exact (a 3-lens adversarial review + aarch64/qemu checks confirmed bit-exact upconvert
-  and no UB; outputs are identical-or-equally-valid-greedy, the same standard the AVX2 path already meets).
-- **Fast `PAD`** (`ggml_compute_forward_pad_f32`). A deep per-op profile found the 256K-vocab **logits pad**, run
-  every forward, was a *scalar, per-element, 4-way-bounds-checked* copy (upstream `// TODO: optimize`). Replaced
-  with a `memcpy`/`memset` fast path parallelized over the vocab axis. **Bit-identical** (KL=0); the PAD slice
-  dropped 1.74% → 0.43% (4.2× faster), for **+1.5–2%** end-to-end across all modes.
-- **ARM-NEON `tanh`** (`ggml_vec_tanh_f32`, for the 256K-vocab final-logit softcap). Implemented and verified
-  *argmax-exact* (softcap is monotonic → identical tokens, confirmed sim 1.0), but **throughput-neutral**, the
-  softcap is only ~1% of a pass. Kept (correct, free, helps sampling/long-context) but **not** a decode-speed win.
-
-- **KleidiAI** (`-DGGML_CPU_KLEIDIAI=ON`), **ARM's own hand-tuned matmul microkernels**, and the biggest single
-  win. The decode is 81.7% matmul; a 15-agent audit confirmed the in-tree `q4_0_4x4` GEMM is near-optimal (hand-
-  written A76 assembly, ~16 SDOT accumulators, 97% of SDOT peak, software prefetch, Q4_K dequant, F32 re-reads and
-  gemv tails were all ruled out). But ARM's KleidiAI `neon_dotprod` kernel, which handles exactly our Q4_0 weights
-  and Q8_0 draft head, **beat it by 8.4%** (weight-matmul time 21.3M→19.5M µs; decode rate 4.48→4.86 passes/s).
-  Weights are bit-exact (repacked Q4_0); it re-quantizes activations with slightly different rounding, so it's
-  distribution-exact (coherent valid greedy paths) but drifts a bit more from the baseline than the other kernels.
-  *Cross-compile note:* KleidiAI's cmake gates its dotprod kernels on a literal `+dotprod` in the arch flags, so the
-  toolchain uses `-march=armv8.2-a+dotprod+fp16` (not `-mcpu=cortex-a76`, which lacks the literal → link failure).
-- **LTO** (`-DGGML_LTO=ON`), link-time optimization, **+1%, bit-identical** (sim 1.0). Free; stacks with the above.
-
-**Net of all kernel work: general 9.4 → 11.3 tok/s (+20%), distribution-exact.** The remaining bottleneck is the
-bandwidth wall, which only an overclock (firmware-locked) or requantization (quality loss) can move.
-
-## "Lossless" means distribution‑exact (an important subtlety)
-
-Speculative decoding is **not byte‑identical** to single‑stream decode: transformer inference isn't
-batch‑invariant, so the multi‑token verify batch rounds floating‑point differently than batch‑1 decode and can
-flip a near‑tie argmax onto a *different but equally valid* greedy path. The rigorous definition of "no quality
-loss" is therefore **distribution‑exact (KL≈0)**, every emitted token is a true argmax of the target, which
-`quality` mode guarantees by construction. `scripts/lossless_gate.py` is the regression harness for it.
-
-## Build & deploy to a Pi
-
-The Pi runs a **cross‑compiled, self‑contained package** (binary + project `.so` + GGUFs); it builds nothing
-itself. Full steps in [`scripts/PI_RUNBOOK.md`](scripts/PI_RUNBOOK.md). Short version, from this x86 dev box:
-
-```bash
-export PI_HOST=mklab@<pi-ip>
-./scripts/pi_build.sh                       # cross-compile llama-server for Cortex-A76 (+ ABI check)
-PI_HOST=$PI_HOST ./scripts/pi_deploy.sh --models   # push binary, scripts, and the GGUFs (resumable)
-ssh $PI_HOST 'cd cpullm && MODE=quality bash scripts/run_pi5.sh launch'
-```
-
-Requires Raspberry Pi OS **bookworm** (glibc ≥ 2.36). The model files: target `gemma-4-E2B-it-Q4_0.gguf`
-(2.9 GB) + draft `mtp-gemma-4-E2B-it.gguf` (94 MB); `scripts/dl_quants.py` fetches them.
-
-## Benchmark / verify
-
-```bash
-# throughput per workload (run on the Pi, or from x86 with HOST=<pi-ip>):
-HOST=<pi-ip> python3 scripts/pi_bench.py 8080 --suite all --n 96
-
-# prove quality mode is distribution-exact vs the pure target:
-python3 scripts/lossless_gate.py REF MTP
-
-# quality of a lossy mode vs greedy (run OFF the Pi, quality is hardware-independent):
-python3 scripts/relaxed_quality.py <ref_port> <cand_port>
-```
-
-## Dials (all optional; the `MODE` presets set sensible defaults)
-
-`run_pi5.sh` reads these env vars, see the `§`‑sections in the script for the measured rationale behind each:
-
-| var | default | what it does |
+| variable | default | effect |
 |---|---|---|
-| `MODE` | `quality` | preset: `quality` \| `fast` \| `turbo` (sets the dials below) |
-| `NMAX` | `3` | MTP draft depth. **3 = fills the A76 4‑row tile** (the optimum); deeper spills and costs. |
-| `TARGET` | `Q4_0` | weight file; `Q4_0` is fastest on A76. Falls back to whatever quant is present. |
-| `RELAX_PRATIO` | `0` | lossy accept: take a non‑argmax draft token if `prob ≥ pratio × top1`. `0` = exact. |
-| `PMIN` | `0.5` | draft confidence gate; lower lets the draft propose deeper (only helps with `RELAX`). |
-| `NGRAM` | `0` | add the n‑gram drafter (helps **only** literal‑repeat output). |
-| `TREE_K` | `1` | tree‑draft (multi‑hypothesis MTP); opt‑in, regresses on this Pi (see `§TREE`). |
+| `MODE` | `quality` | preset: `quality`, `fast`, or `turbo` |
+| `NMAX` | `3` | MTP draft depth; 3 fills the A76 four-row tile and is the optimum |
+| `TARGET` | `Q4_0` | weight file; Q4_0 is fastest on the A76 |
+| `RELAX_PRATIO` | `0` | accept a non-argmax draft token if its probability is at least this fraction of the top token; 0 is exact |
+| `PMIN` | `0.5` | draft confidence gate; lower lets the draft propose deeper |
+| `NGRAM` | `0` | add the n-gram drafter, which helps only on repetitive output |
+| `TREE_K` | `1` | tree-draft (multi-hypothesis); opt-in, and slower on this Pi |
+
+## The model
+
+Mote runs Gemma-4-E2B in Q4_0 GGUF form, with the model's multi-token-prediction head as the draft. It keeps
+2.3B effective parameters and 5.1B in total; the extra mass is a per-layer embedding table read as a lookup
+rather than multiplied, so it streams from storage instead of occupying working memory. The text-only GGUF
+loads as about 4.65B parameters, since it carries that table but drops the vision and audio encoders. The files
+are at [unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF): the Q4_0 target is
+2.9 GB and the draft head is 94 MB, and the installer fetches both. Use of the model is governed by the
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms); Mote's own code is Apache 2.0.
+
+---
+
+The rest of this document is for the curious: how the speedup is built, what was tried and abandoned, and how
+to build and release it yourself.
+
+## How it works
+
+CPU decode is bound by memory bandwidth. Each token streams the entire weight set through RAM once, so
+`tokens/sec ≈ sustained_bandwidth / bytes_per_token`. Everything here either amortizes that read or removes a
+stall the stock engine leaves on the A76.
+
+**Speculative decoding** is the main lever. Gemma-4-E2B ships a 94 MB multi-token-prediction head that drafts
+tokens ahead; the full model verifies the whole draft in one batched pass and keeps the tokens that match its
+own greedy output. One weight read then yields several tokens instead of one.
+
+**Fill the four-row tile.** The A76 int8 matmul reads the weights once per group of four output rows. The
+verify batch is one sampled token plus `n_max` drafts, so `n_max = 3` makes a batch of four that lands on
+exactly one tile: a single pass over the weights returns four positions. A fourth draft widens the batch to
+five and spills a row into a second full pass over the matrix, which costs more than the token it buys.
+Measured draft depth: `n_max` 2 gives 6.3, 3 gives 9.4, 4 gives 7.9 tokens per second. Choosing Q4_0 over
+Q4_K_M adds a little more, because its flat per-32 dequant runs near the A76's SDOT peak.
+
+**Cortex-A76 kernels.** Profiling a quality-mode pass found the engine near-optimal except where Gemma's
+MatFormer scaffolding hit generic, unvectorized code on the A76:
+
+- A NEON `bf16` dot product (`ggml_vec_dot_bf16`). The A76 has no bf16 dot instruction, so the per-layer
+  projection weights, read every pass, ran a scalar loop; upstream had AVX and POWER paths but none for NEON.
+  The NEON path mirrors the AVX2 arithmetic exactly and saves about 16 ms per pass.
+- A fast logits `PAD` (`ggml_compute_forward_pad_f32`). The per-step pad over the 256K-token vocabulary was a
+  scalar, per-element, bounds-checked copy; it is now a row-wise memcpy parallelized across the vocabulary,
+  bit-identical to the original.
+
+**Arm KleidiAI.** Decode is more than 80% weight matmul. The in-tree `q4_0_4x4` GEMM is hand-written A76
+assembly already near the SDOT peak, but Arm's KleidiAI `neon_dotprod` microkernel, which handles exactly these
+Q4_0 weights, beats it by about 8%. Enabling it (`-DGGML_CPU_KLEIDIAI=ON`) requires `-march=armv8.2-a+dotprod+fp16`
+in the toolchain, because KleidiAI's build gates the dot-product kernels on a literal `+dotprod` in the arch
+flags.
+
+**Link-time optimization** (`-DGGML_LTO=ON`) inlines the dequant and dot-product inner loops across file
+boundaries and adds about 1%.
+
+Together the kernel and build work takes general decode from 9.4 to 11.3 tokens per second, all
+distribution-exact. The remaining bottleneck is the bandwidth wall, which only an overclock (firmware-locked)
+or requantization (quality loss) can move.
+
+**"Lossless" means distribution-exact.** Speculative decoding is not byte-identical to single-stream decode:
+transformer inference is not batch-invariant, so the multi-token verify batch rounds floating point differently
+than a batch of one and can flip a near-tie argmax onto a different but equally valid greedy path. The precise
+guarantee is therefore distribution-exact, KL near zero: every emitted token is a true argmax of the target.
+Quality mode holds to that by construction, and `scripts/lossless_gate.py` is its regression test.
+
+**Why 15 tokens per second is not reachable for general text here.** Two walls cap it. The verify read is
+bandwidth-bound, which fixes the pass rate at about 4.2 per second; an Arm overclock does not move it because
+the Pi 5's LPDDR4X timing is fixed. And the draft can only predict so far: even accepting every near-miss, the
+MTP head's second- and third-token accuracy caps accepted tokens per pass near 2.6 of a possible 4. That
+product is about 11, not 15. Reaching 15 would need a structurally better draft or a smaller draft-compatible
+target, neither of which exists for this model. The high teens are reachable only on repetitive output, which
+is what turbo targets.
+
+## Dead ends (measured, do not retry)
+
+- **Q3_K_M and 2-bit.** Fewer bytes but slower on the A76: with no repacked kernel it goes compute-bound, and
+  the quality drop is not worth it for E2B.
+- **n_max above 3.** Spills the four-row tile, re-streams the weights, and nets slower.
+- **Tree-draft on the Pi.** Adds verify rows that spill the tile and costs about 14%; it only wins on
+  faster-memory hosts.
+- **Relaxed acceptance for general text.** A weak lever, 17% at most for a large quality drop, so it lives in
+  `fast` and `turbo` for those who want it.
+- **Arm overclock for general decode.** The verify is bandwidth-bound, so it barely moves general throughput.
+
+## For maintainers
+
+The Pi runs a cross-compiled, self-contained package and builds nothing itself. From an x86 machine:
+
+```bash
+export PI_HOST=user@<pi-ip>
+./scripts/pi_build.sh                              # cross-compile llama-server for Cortex-A76
+PI_HOST=$PI_HOST ./scripts/pi_deploy.sh --models   # push the binary, scripts, and GGUFs
+```
+
+To cut a release, build the self-contained tarball, then attach it and `install.sh` to a GitHub release:
+
+```bash
+bash scripts/package_release.sh        # builds the A76 binary and writes dist/gemma-pi5.tar.gz
+gh release create v1.0 dist/gemma-pi5.tar.gz scripts/install.sh -t v1.0 -n "Prebuilt Pi 5 package"
+```
+
+The Quick start one-liner then works for anyone. Full notes are in [`docs/RELEASE.md`](docs/RELEASE.md). The
+fork point and the changes Mote makes to the engine are documented in
+[`third_party/llama.cpp/MOTE.md`](third_party/llama.cpp/MOTE.md), with the isolated diff against upstream in
+[`patches/mote-llama.cpp.patch`](patches/mote-llama.cpp.patch).
 
 ## Repository layout
 
-- [`scripts/run_pi5.sh`](scripts/run_pi5.sh), turnkey Pi 5 launcher with the three modes + all dials.
-- [`scripts/PI_RUNBOOK.md`](scripts/PI_RUNBOOK.md), build / deploy / run / A‑B on a real Pi.
-- `scripts/pi_bench.py`, per‑workload throughput (the hardware‑independent tokens/pass + wall‑clock tok/s).
-- `scripts/lossless_gate.py`, distribution‑equivalence gate for `quality` mode.
-- `scripts/relax_sweep.py`, `relax_sweep2.py`, `x86_serve.sh`, the off‑Pi (pratio × p‑min) exploration harness.
-- `scripts/pi_build.sh`, `pi_deploy.sh`, cross‑build and deploy.
-- `PLAN.md`, full engineering log (physics, every measurement, the dead ends).
-- `third_party/llama.cpp`, patched engine (MTP + n‑gram + relaxed‑accept knobs + parallelized M=1 GEGLU +
-  ARM‑NEON `bf16` dot + fast `PAD`; built with ARM **KleidiAI** matmul kernels + **LTO**; see *Kernel work*).
-
-## Dead ends (measured, don't re‑try)
-
-- **Q3_K_M / 2‑bit**, fewer bytes but *slower* on A76: no repacked kernel → compute‑bound at ~7.8 GB/s, and
-  the quality drop isn't worth it for E2B.
-- **n_max > 3**, spills the 4‑row tile, re‑streams weights, nets slower.
-- **tree‑draft on the Pi**, adds verify rows that spill the tile (−14%); it only wins on fast‑memory hosts.
-- **relaxed acceptance for general text**, a weak lever (+17% max for a large quality drop). The earlier
-  "~13.5 tok/s" claim for it was a measurement artifact; real is ~11. It's in `fast`/`turbo` for those who want it.
-- **arm overclock for general decode**, the verify is bandwidth‑bound, so it barely moves general tok/s.
+- [`scripts/`](scripts/), the installer, the `gemma` CLI, the `run_pi5.sh` launcher, the cross-build and
+  deploy scripts, the benchmark, and the release packager.
+- [`third_party/llama.cpp/`](third_party/llama.cpp/), the patched engine; see
+  [`MOTE.md`](third_party/llama.cpp/MOTE.md).
+- [`patches/`](patches/), the isolated diff against upstream llama.cpp.
+- [`web/`](web/), the project page.
