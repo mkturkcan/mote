@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# gemma — dead-simple control for the Gemma-4-E2B server on this Raspberry Pi 5.
+#   gemma start [quality|fast|turbo]   start the server (default: quality = lossless)
+#   gemma chat                         chat in this terminal
+#   gemma ui                           print the browser chat URL
+#   gemma bench                        quick speed test
+#   gemma status | stop
+set -uo pipefail
+CPULLM="${CPULLM_HOME:-$HOME/cpullm}"
+PORT="${PORT:-8080}"
+RUN="$CPULLM/scripts/run_pi5.sh"
+myip(){ hostname -I 2>/dev/null | awk '{print $1}'; }
+up(){ curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
+
+case "${1:-help}" in
+  start)
+    mode="${2:-quality}"
+    up && { echo "already running. 'gemma stop' first, or just 'gemma chat'."; exit 0; }
+    echo "starting gemma [$mode] ..."
+    setsid env MODE="$mode" bash "$RUN" launch </dev/null >/tmp/gemma.log 2>&1 &
+    for i in $(seq 1 90); do up && break; sleep 1; done
+    if up; then
+      echo "ready ✓"
+      echo "  • chat in a browser:   http://$(myip):$PORT"
+      echo "  • chat in terminal:    gemma chat"
+    else echo "failed to start — see /tmp/gemma.log"; tail -5 /tmp/gemma.log; fi
+    ;;
+  stop)   pkill -x llama-server 2>/dev/null && echo "stopped" || echo "not running" ;;
+  status)
+    if up; then echo "running: $(grep -h '\[launch\]' /tmp/gemma.log 2>/dev/null | tail -1)"
+    else echo "not running ('gemma start')"; fi ;;
+  ui)     echo "open in any browser on your network:  http://$(myip):$PORT" ;;
+  bench)
+    up || { echo "not running — 'gemma start' first"; exit 1; }
+    HOST=127.0.0.1 python3 "$CPULLM/scripts/pi_bench.py" "$PORT" --suite general --n 64 ;;
+  chat)
+    up || { echo "not running — 'gemma start' first"; exit 1; }
+    echo "Gemma chat — type a message, Ctrl-C to quit."
+    while true; do
+      printf "\n\033[1;36myou>\033[0m "; IFS= read -r q || break
+      [ -z "$q" ] && continue
+      printf "\033[1;32mgemma>\033[0m "
+      body=$(python3 -c "import json,sys; print(json.dumps({'messages':[{'role':'user','content':sys.argv[1]}],'stream':True,'temperature':0}))" "$q")
+      curl -sN "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "$body" \
+        | python3 -u -c "import sys,json
+for line in sys.stdin:
+    line=line.strip()
+    if not line.startswith('data: '): continue
+    d=line[6:]
+    if d=='[DONE]': break
+    try: sys.stdout.write(json.loads(d)['choices'][0]['delta'].get('content','')); sys.stdout.flush()
+    except Exception: pass
+print()"
+    done ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

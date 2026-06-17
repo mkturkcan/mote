@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mote: Language models on a Raspberry Pi 5</title>
+<meta name="description" content="Mote is a community project running capable language models on small, common hardware. Gemma-4-E2B decoding at 11 tokens per second on a Raspberry Pi 5: speculative decoding, hand-written Cortex-A76 kernels, and Arm KleidiAI." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --bg:#080a0e; --bg2:#0c0f15; --surface:#11151d; --surface2:#161b24;
+    --border:#1d242f; --border2:#283140;
+    --text:#e8ebf1; --muted:#9aa4b4; --faint:#6b7585;
+    --rasp:#e6486d; --rasp-dim:#b83557;
+    --teal:#36d39a; --teal-dim:#1f9d72;
+    --gold:#d9a441;
+    --r:14px;
+    --maxw:1140px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    line-height:1.6; -webkit-font-smoothing:antialiased; overflow-x:hidden;
+  }
+  .mono{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace}
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px}
+  .accent{color:var(--rasp)}
+  .teal{color:var(--teal)}
+
+  /* nav */
+  nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(12px);
+    background:rgba(8,10,14,.72);border-bottom:1px solid var(--border)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:64px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em}
+  .brand .dot{width:10px;height:10px;border-radius:50%;
+    background:var(--rasp);box-shadow:0 0 12px rgba(230,72,109,.55)}
+  .brand .mono{font-size:15px}
+  .navlinks{display:flex;align-items:center;gap:30px;font-size:14px;color:var(--muted);font-weight:500}
+  .navlinks a:hover{color:var(--text)}
+  .navlinks .gh{color:var(--text);border:1px solid var(--border2);padding:7px 14px;border-radius:9px}
+  .navlinks .gh:hover{border-color:var(--rasp);background:rgba(230,72,109,.08)}
+  @media(max-width:720px){.navlinks a:not(.gh){display:none}}
+
+  /* hero */
+  .hero{position:relative;min-height:84vh;display:flex;align-items:center;overflow:hidden;padding:48px 0}
+  .hero::before{content:"";position:absolute;inset:0;z-index:0;pointer-events:none;
+    background:linear-gradient(176deg,rgba(54,211,154,.04),transparent 240px),
+      linear-gradient(250deg,rgba(230,72,109,.06),transparent 46%);}
+  .kick{display:flex;align-items:center;gap:14px;font-size:13.5px;font-weight:500;color:var(--muted);letter-spacing:.01em}
+  .kick .rule{width:30px;height:1px;background:var(--rasp);opacity:.85;flex:none}
+  .kick b{color:var(--text);font-weight:600}
+  h1{font-size:clamp(33px,5vw,52px);line-height:1.05;font-weight:800;letter-spacing:-.025em;margin:22px 0 0}
+  h1 .em{background:linear-gradient(120deg,#ff7da0,var(--rasp));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{color:var(--muted);font-size:clamp(16px,2vw,18.5px);max-width:560px;margin-top:20px}
+  .lede b{color:var(--text);font-weight:600}
+  .spec{display:flex;flex-wrap:wrap;gap:9px 17px;margin-top:26px;
+    font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--muted)}
+  .spec span{position:relative;white-space:nowrap}
+  .spec span:not(:last-child)::after{content:"";position:absolute;right:-9px;top:3px;bottom:3px;width:1px;background:var(--border2)}
+  .spec b{color:var(--text);font-weight:500}
+  .cta{display:flex;gap:13px;margin-top:30px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:9px;font-weight:600;font-size:14.5px;padding:12px 20px;border-radius:11px;transition:.18s}
+  .btn.primary{background:var(--rasp);color:#fff;box-shadow:0 8px 30px -8px rgba(230,72,109,.6)}
+  .btn.primary:hover{background:#f15a7c;transform:translateY(-1px)}
+  .btn.ghost{border:1px solid var(--border2);color:var(--text)}
+  .btn.ghost:hover{border-color:var(--muted);background:var(--surface)}
+
+  /* 3d hero background */
+  .stage{position:absolute;inset:0;z-index:1;pointer-events:none;will-change:opacity}
+  #pi-canvas{width:100%;height:100%;display:block}
+  .scrim{position:absolute;inset:0;z-index:2;pointer-events:none;
+    background:linear-gradient(90deg,var(--bg) 0%,rgba(8,10,14,.9) 24%,rgba(8,10,14,.56) 50%,rgba(8,10,14,.34) 100%),
+      linear-gradient(180deg,rgba(8,10,14,.62),rgba(8,10,14,.22) 34%,rgba(8,10,14,.1) 70%),
+      linear-gradient(0deg,var(--bg),transparent 24%)}
+  .herocontent{position:relative;z-index:3;width:100%}
+  .herocontent .col{max-width:620px}
+  .herocontent h1{text-shadow:0 2px 22px rgba(0,0,0,.55)}
+  .herocontent .kick,.herocontent .lede,.herocontent .spec{text-shadow:0 1px 11px rgba(0,0,0,.6)}
+  @media(max-width:920px){
+    .hero{min-height:auto;padding:54px 0 60px}
+    .scrim{background:linear-gradient(0deg,var(--bg) 3%,rgba(8,10,14,.62) 42%,transparent 86%)}
+  }
+
+  /* mission */
+  .mission{padding:50px 0;border-top:1px solid var(--border);
+    background:linear-gradient(180deg,rgba(230,72,109,.05),transparent 70%)}
+  .mission p{font-size:clamp(18px,2.5vw,24px);font-weight:500;letter-spacing:-.012em;color:var(--text);max-width:790px;line-height:1.5}
+  .mission .accent{font-weight:700}
+  .mission .q{color:var(--muted)}
+
+  /* sections */
+  section{padding:72px 0;border-top:1px solid var(--border)}
+  .kicker{font-size:12.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--rasp)}
+  h2{font-size:clamp(26px,3.4vw,36px);font-weight:800;letter-spacing:-.025em;margin:12px 0 0}
+  .sub{color:var(--muted);max-width:620px;margin-top:14px;font-size:16.5px}
+
+  /* charts */
+  .chartcard{margin-top:40px;border:1px solid var(--border);background:linear-gradient(180deg,var(--surface),var(--bg2));
+    border-radius:18px;padding:30px 30px 34px}
+  .chartcard h3{font-size:15px;font-weight:600;letter-spacing:-.01em}
+  .chartcard .ctx{font-size:13.5px;color:var(--faint);margin-top:3px}
+  .legend{display:flex;gap:22px;margin:20px 0 26px;font-size:13px;color:var(--muted)}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:8px;vertical-align:-1px}
+  .sw-stock{background:#3a4456}
+  .sw-ours{background:linear-gradient(180deg,var(--teal),var(--teal-dim))}
+
+  .wlgroup{margin-bottom:24px}
+  .wlgroup:last-child{margin-bottom:0}
+  .wlhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}
+  .wlhead .name{font-weight:600;font-size:15px}
+  .wlhead .desc{font-size:12.5px;color:var(--faint)}
+  .wlhead .mult{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--teal);font-weight:500}
+  .bar{position:relative;height:30px;border-radius:8px;background:rgba(255,255,255,.025);margin:7px 0;overflow:hidden}
+  .bar .fill{position:absolute;inset:0 auto 0 0;width:0;border-radius:8px;transition:width 1.1s cubic-bezier(.22,.61,.36,1)}
+  .bar.stock .fill{background:#3a4456}
+  .bar.ours .fill{background:linear-gradient(90deg,var(--teal-dim),var(--teal))}
+  .bar .val{position:absolute;top:0;right:11px;height:30px;display:flex;align-items:center;
+    font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;color:#fff;opacity:0;transition:opacity .5s .5s}
+  .bar .tag{position:absolute;top:0;left:12px;height:30px;display:flex;align-items:center;font-size:12px;color:var(--muted)}
+  .bar.show .fill{}
+  .bar.show .val{opacity:.92}
+
+  /* buildup */
+  .buildup{display:grid;gap:14px;margin-top:8px}
+  .step{display:grid;grid-template-columns:200px 1fr;gap:18px;align-items:center}
+  @media(max-width:640px){.step{grid-template-columns:1fr}}
+  .step .lab{font-size:13.5px}
+  .step .lab .t{font-weight:600}
+  .step .lab .d{color:var(--faint);font-size:12px}
+  .step .track{position:relative;height:36px;background:rgba(255,255,255,.025);border-radius:9px;overflow:hidden}
+  .step .track .f{position:absolute;inset:0 auto 0 0;width:0;border-radius:9px;display:flex;align-items:center;justify-content:flex-end;
+    padding-right:13px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:#06140f;
+    transition:width 1.1s cubic-bezier(.22,.61,.36,1)}
+  .step:nth-child(1) .f{background:#3a4456;color:#cdd5e2}
+  .step:nth-child(2) .f{background:linear-gradient(90deg,#2b7d8f,#3aa6b0)}
+  .step:nth-child(3) .f{background:linear-gradient(90deg,var(--teal-dim),var(--teal))}
+
+  /* modes */
+  .modes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:40px}
+  @media(max-width:760px){.modes{grid-template-columns:1fr}}
+  .mode{border:1px solid var(--border);background:var(--surface);border-radius:16px;padding:22px}
+  .mode.def{border-color:var(--border2);box-shadow:inset 0 0 0 1px rgba(54,211,154,.12)}
+  .mode .top{display:flex;align-items:center;justify-content:space-between}
+  .mode .nm{font-weight:700;font-size:17px;letter-spacing:-.01em}
+  .mode .badge{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--teal);
+    border:1px solid var(--teal-dim);border-radius:6px;padding:2px 7px}
+  .mode .qual{color:var(--muted);font-size:13px;margin-top:6px;min-height:38px}
+  .mode .nums{display:flex;gap:18px;margin-top:16px;border-top:1px solid var(--border);padding-top:15px}
+  .mode .nums div{display:flex;flex-direction:column}
+  .mode .nums .v{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:17px}
+  .mode .nums .k{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em;margin-top:1px}
+
+  /* techniques */
+  .tech{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:42px}
+  @media(max-width:760px){.tech{grid-template-columns:1fr}}
+  .tcard{border:1px solid var(--border);background:linear-gradient(180deg,var(--surface),var(--bg2));
+    border-radius:16px;padding:26px 26px;position:relative;overflow:hidden}
+  .tcard::after{content:"";position:absolute;top:0;left:0;right:0;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(230,72,109,.5),transparent);opacity:.5}
+  .tcard .ix{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--rasp);font-weight:500}
+  .tcard h3{font-size:19px;font-weight:700;letter-spacing:-.02em;margin:10px 0 0}
+  .tcard h3 small{display:block;font-size:12.5px;font-weight:500;color:var(--faint);letter-spacing:.02em;margin-top:4px;font-family:'JetBrains Mono',monospace}
+  .tcard p{color:var(--muted);font-size:14.5px;margin-top:12px}
+  .tcard p b{color:var(--text);font-weight:600}
+  .tcard a{color:var(--text);border-bottom:1px solid var(--border2);transition:.15s}
+  .tcard a:hover{color:var(--rasp);border-color:var(--rasp)}
+  .tcard code{font-family:'JetBrains Mono',monospace;font-size:.9em}
+
+  /* install */
+  .install{border:1px solid var(--border);background:var(--surface);border-radius:16px;padding:8px;margin-top:36px}
+  .install .bar2{display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--border)}
+  .install .bar2 .d{width:11px;height:11px;border-radius:50%}
+  .install .bar2 .r{background:#ff5f57}.install .bar2 .y{background:#febc2e}.install .bar2 .g{background:#28c840}
+  .install .bar2 span{margin-left:8px;font-size:12px;color:var(--faint)}
+  .install pre{padding:20px 18px;overflow-x:auto}
+  .install code{font-family:'JetBrains Mono',monospace;font-size:13.5px;line-height:1.9;color:#dfe5ee}
+  .install .cmt{color:var(--faint)}.install .pr{color:var(--teal)}.install .fl{color:var(--rasp)}
+  .runline{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}
+  .runline .pill{font-family:'JetBrains Mono',monospace;font-size:13px;border:1px solid var(--border2);
+    background:var(--surface);border-radius:9px;padding:8px 13px;color:var(--muted)}
+  .runline .pill b{color:var(--text);font-weight:500}
+
+  footer{border-top:1px solid var(--border);padding:40px 0;color:var(--faint);font-size:13.5px}
+  footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px}
+  footer a{color:var(--muted)} footer a:hover{color:var(--text)}
+  footer .motto{flex-basis:100%;order:3;margin-top:24px;padding-top:20px;border-top:1px solid var(--border);
+    text-align:center;font-family:'JetBrains Mono',monospace;font-size:11.5px;letter-spacing:.34em;
+    text-transform:uppercase;color:var(--faint)}
+
+  .reveal{opacity:0;transform:translateY(16px);transition:opacity .7s,transform .7s}
+  .reveal.in{opacity:1;transform:none}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand"><span class="dot"></span><span class="mono">mote</span></div>
+    <div class="navlinks">
+      <a href="#performance">Performance</a>
+      <a href="#how">How it works</a>
+      <a href="#install">Install</a>
+      <a class="gh" href="https://github.com/mkturkcan/mote">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="stage"><canvas id="pi-canvas"></canvas></div>
+  <div class="scrim"></div>
+  <div class="wrap herocontent">
+    <div class="col">
+      <div class="kick"><span class="rule"></span>An open project for the <b>Intelligence of Things</b></div>
+      <h1>A 2.3B model, decoding at <span class="em">11 tokens a second</span> on a Pi 5.</h1>
+      <p class="lede">Mote is a community project for running capable language models on small, common hardware.
+        Here it is on a Raspberry Pi 5: four Arm Cortex-A76 cores, 8&nbsp;GB of RAM, no accelerator. Speculative
+        decoding, hand-written A76 kernels, and Arm KleidiAI raise general-text throughput from <b>6.6</b> to
+        <b>11.2</b> tokens per second, and the default mode leaves the model's output unchanged.</p>
+      <div class="cta">
+        <a class="btn primary" href="#install">Install on a Pi →</a>
+        <a class="btn ghost" href="#how">How it works</a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section class="mission">
+  <div class="wrap">
+    <p><span class="accent">The Intelligence of Things.</span> <span class="q">The capability that lives in
+      datacenters should also run on the processors already around us: a board on a bench, a controller in a robot,
+      a sensor in a field. Mote is the inference stack to put it there, starting with the Raspberry Pi 5 and the Arm
+      cores that permeate much of the embedded world.</span></p>
+  </div>
+</section>
+
+<section id="performance">
+  <div class="wrap">
+    <span class="kicker">Performance</span>
+    <h2>The same model, run two ways.</h2>
+    <p class="sub">Every number is measured on a Raspberry Pi 5 with the Q4_0 weights and four threads. The baseline
+      is the identical GGUF served by a stock library with single-stream decoding, the path you get out of the box.</p>
+
+    <div class="chartcard reveal">
+      <h3>Tokens per second, by workload</h3>
+      <p class="ctx">Stock single-stream decode vs. the default quality mode.</p>
+      <div class="legend">
+        <span><i class="sw-stock"></i>Stock GGUF</span>
+        <span><i class="sw-ours"></i>This release · quality mode</span>
+      </div>
+      <div id="wlchart"></div>
+    </div>
+
+    <div class="chartcard reveal">
+      <h3>Where the throughput comes from</h3>
+      <p class="ctx">General-text decode, built up one layer at a time.</p>
+      <div class="buildup" id="buildup">
+        <div class="step"><div class="lab"><div class="t">Stock GGUF</div><div class="d">Single-stream decode, no extras</div></div><div class="track"><div class="f" data-w="6.6" data-max="11.2">6.6</div></div></div>
+        <div class="step"><div class="lab"><div class="t">+ Speculative decoding</div><div class="d">MTP draft head, depth matched to the matmul tile</div></div><div class="track"><div class="f" data-w="9.4" data-max="11.2">9.4</div></div></div>
+        <div class="step"><div class="lab"><div class="t">+ A76 kernels &amp; KleidiAI</div><div class="d">bf16 dot, PAD, KleidiAI GEMM, LTO</div></div><div class="track"><div class="f" data-w="11.2" data-max="11.2">11.2</div></div></div>
+      </div>
+    </div>
+
+    <div class="modes reveal">
+      <div class="mode def">
+        <div class="top"><span class="nm">quality</span><span class="badge">default</span></div>
+        <p class="qual">Distribution-faithful: every token is a true argmax of the full model without quality loss.</p>
+        <div class="nums">
+          <div><span class="v">11.2</span><span class="k">general</span></div>
+          <div><span class="v">13.4</span><span class="k">structured</span></div>
+          <div><span class="v">16.0</span><span class="k">boilerplate</span></div>
+        </div>
+      </div>
+      <div class="mode">
+        <div class="top"><span class="nm">fast</span></div>
+        <p class="qual">Accepts near-miss draft tokens. Trades a small amount of fidelity for more throughput on prose.</p>
+        <div class="nums">
+          <div><span class="v">12.5</span><span class="k">general</span></div>
+          <div><span class="v">13.9</span><span class="k">structured</span></div>
+          <div><span class="v">17.2</span><span class="k">boilerplate</span></div>
+        </div>
+      </div>
+      <div class="mode">
+        <div class="top"><span class="nm">turbo</span></div>
+        <p class="qual">Adds an n-gram drafter for repeated spans. Built for logs, data dumps, and templated output.</p>
+        <div class="nums">
+          <div><span class="v">12.3</span><span class="k">general</span></div>
+          <div><span class="v">13.4</span><span class="k">structured</span></div>
+          <div><span class="v">20.4</span><span class="k">boilerplate</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <span class="kicker">How it works</span>
+    <h2>Five changes, from the algorithm down to the link step.</h2>
+    <p class="sub">Decode on a CPU is bound by memory bandwidth: each token streams the full weight set through RAM.
+      Everything here either amortizes that read or removes a stall the stock engine leaves on Arm.</p>
+
+    <div class="tech">
+      <div class="tcard reveal">
+        <span class="ix">01</span>
+        <h3>Speculative decoding<small>Gemma MTP head</small></h3>
+        <p>Gemma-4-E2B ships a multi-token-prediction head that drafts several tokens ahead. The main model verifies
+          the whole draft in one batched pass and keeps the tokens that match its own greedy output. Decode is bound
+          by memory bandwidth: every step streams the entire weight set through RAM, and that read dominates the time.
+          The A76's int8 matmul reads those weights once for each group of four output rows, so the draft is set three
+          tokens deep. The verify batch is then four wide, three drafts plus the token already committed, and lands on
+          exactly one four-row group, so a single pass over the weights returns all four positions. A fourth draft
+          would widen the batch to five, spilling a row into a second pass that streams the whole matrix again, which
+          costs more than the token it buys.</p>
+      </div>
+      <div class="tcard reveal">
+        <span class="ix">02</span>
+        <h3>Cortex-A76 kernels<small>bf16 dot · vocabulary pad</small></h3>
+        <p>The A76 has no bf16 dot-product instruction, so the stock engine runs the model's bf16 projection weights
+          through a scalar loop. The replacement,
+          <a href="https://github.com/mkturkcan/mote/blob/main/third_party/llama.cpp/ggml/src/ggml-cpu/vec.cpp"><code>ggml_vec_dot_bf16</code></a>,
+          widens bf16 to f32 in register and accumulates on the NEON pipeline, following the same arithmetic as the
+          x86 vector path. The second,
+          <a href="https://github.com/mkturkcan/mote/blob/main/third_party/llama.cpp/ggml/src/ggml-cpu/ops.cpp"><code>ggml_compute_forward_pad_f32</code></a>,
+          rewrites the per-step pad over the 256K-token vocabulary, once a per-element bounds-checked copy, as a
+          row-wise <b>memcpy</b> parallelized across the vocabulary.</p>
+      </div>
+      <div class="tcard reveal">
+        <span class="ix">03</span>
+        <h3>Arm KleidiAI<small>int8 dot-product GEMM</small></h3>
+        <p>KleidiAI is Arm's library of microkernels tuned for cores like the A76. Enabling it routes the Q4_0 weight
+          matmuls, the bulk of every forward pass, through KleidiAI's int8 dot-product GEMM, which outruns the
+          engine's own repacked kernel on this core.</p>
+      </div>
+      <div class="tcard reveal">
+        <span class="ix">04</span>
+        <h3>Link-time optimization<small>whole-program build</small></h3>
+        <p>The engine is compiled with link-time optimization. The dequantization and dot-product inner loops, called
+          across file boundaries on every token, inline into their callers, and the compiler schedules the result for
+          the A76 pipeline with the whole program in view rather than one file at a time.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <span class="kicker">Install</span>
+    <h2>One command on Raspberry Pi OS.</h2>
+    <p class="sub">Builds the tuned server, fetches the model, installs the <span class="mono" style="color:var(--text)">gemma</span>
+      command, and applies the system tuning. Then it serves an OpenAI-compatible API and a web chat UI on port 8080.</p>
+
+    <div class="install reveal">
+      <div class="bar2"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span>pi@raspberrypi: ~</span></div>
+<pre><code><span class="cmt"># clone, then build + install in one step:</span>
+git clone https://github.com/mkturkcan/mote &amp;&amp; cd mote
+bash scripts/install.sh
+
+<span class="cmt"># run it</span>
+<span class="pr">gemma</span> start            <span class="cmt"># quality mode, lossless</span>
+<span class="pr">gemma</span> chat             <span class="cmt"># or open  http://&lt;pi&gt;:8080  in a browser</span>
+<span class="pr">gemma</span> start <span class="fl">turbo</span>      <span class="cmt"># tuned for repetitive output</span></code></pre>
+    </div>
+    <div class="runline">
+      <span class="pill"><b>gemma start</b> · launch</span>
+      <span class="pill"><b>gemma chat</b> · terminal chat</span>
+      <span class="pill"><b>gemma bench</b> · measure</span>
+      <span class="pill"><b>gemma stop</b></span>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div style="max-width:540px">
+      <span class="brand" style="font-weight:600"><span class="dot" style="width:9px;height:9px"></span><span class="mono">mote</span></span>
+      <p style="margin-top:11px;color:var(--muted)">An open community project building the Intelligence of Things:
+        language models that run on commodity and embedded hardware. The Raspberry Pi 5 is the first target of many.
+        Mote is independent and not affiliated with the developers of Gemma.</p>
+    </div>
+    <div style="text-align:right">Gemma-4-E2B · Q4_0 · Cortex-A76<br><a href="https://github.com/mkturkcan/mote">GitHub</a> &nbsp; <a href="https://huggingface.co/mehmetkeremturkcan/mote">Model card</a></div>
+    <div class="motto">so mote it be</div>
+  </div>
+</footer>
+
+<script>
+/* ---------- charts ---------- */
+const STOCK = 6.6;
+const WL = [
+  {name:'General',     desc:'Prose, code, reasoning',     ours:11.2},
+  {name:'Structured',  desc:'JSON, SQL, CSV, code',       ours:13.4},
+  {name:'Boilerplate', desc:'Logs, repeated lines',       ours:16.0},
+];
+const CHART_MAX = 21;
+(function(){
+  const root = document.getElementById('wlchart');
+  WL.forEach(w=>{
+    const mult = (w.ours/STOCK).toFixed(1);
+    const g = document.createElement('div'); g.className='wlgroup';
+    g.innerHTML = `
+      <div class="wlhead"><span><span class="name">${w.name}</span> &nbsp;<span class="desc">${w.desc}</span></span>
+        <span class="mult">${mult}× faster</span></div>
+      <div class="bar stock"><div class="fill" data-w="${(STOCK/CHART_MAX*100).toFixed(1)}"></div><span class="tag">stock</span><span class="val">${STOCK.toFixed(1)}</span></div>
+      <div class="bar ours"><div class="fill" data-w="${(w.ours/CHART_MAX*100).toFixed(1)}"></div><span class="tag" style="color:#06140f">quality</span><span class="val">${w.ours.toFixed(1)}</span></div>`;
+    root.appendChild(g);
+  });
+})();
+
+function animateBars(scope){
+  scope.querySelectorAll('.bar .fill').forEach(f=>{ f.style.width = f.dataset.w + '%'; });
+  scope.querySelectorAll('.bar').forEach(b=> b.classList.add('show'));
+  scope.querySelectorAll('.buildup .f').forEach(f=>{
+    const pct = (parseFloat(f.dataset.w)/parseFloat(f.dataset.max))*100; f.style.width = pct + '%';
+  });
+}
+
+/* reveal + chart triggers */
+const io = new IntersectionObserver((es)=>{
+  es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in');
+    if(e.target.id==='wlchart'||e.target.id==='buildup'||e.target.querySelector?.('.bar,.buildup')) animateBars(e.target);
+    io.unobserve(e.target);} });
+},{threshold:.25});
+document.querySelectorAll('.reveal,#wlchart,#buildup').forEach(el=>io.observe(el));
+
+/* ---------- 3D Raspberry Pi 5 ---------- */
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.137.0/build/three.min.js"></script>
+<script>
+(function(){
+  var THREE = window.THREE;
+  var canvas = document.getElementById('pi-canvas');
+  if(!THREE || !canvas) return;
+  var renderer;
+  try { renderer = new THREE.WebGLRenderer({canvas:canvas, antialias:true, alpha:true}); } catch(e){ return; }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
+  if('outputEncoding' in renderer) renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 0.64;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+  var scene = new THREE.Scene();
+
+  // soft environment for the metal reflections, built from a tiny vertical linear-gradient canvas
+  (function(){
+    var c = document.createElement('canvas'); c.width = 16; c.height = 128;
+    var g = c.getContext('2d'); var grad = g.createLinearGradient(0,0,0,128);
+    grad.addColorStop(0,'#2b3442'); grad.addColorStop(0.55,'#11151d'); grad.addColorStop(1,'#05070a');
+    g.fillStyle = grad; g.fillRect(0,0,16,128);
+    var tex = new THREE.CanvasTexture(c); tex.mapping = THREE.EquirectangularReflectionMapping;
+    var pm = new THREE.PMREMGenerator(renderer);
+    scene.environment = pm.fromEquirectangular(tex).texture;
+    tex.dispose(); pm.dispose();
+  })();
+
+  var camera = new THREE.PerspectiveCamera(33, 1, 1, 2000);
+
+  scene.add(new THREE.HemisphereLight(0xbcd3ff, 0x0a0c10, .32));
+  var key = new THREE.DirectionalLight(0xffffff, 1.3);
+  key.position.set(60, 110, 70); key.castShadow = true;
+  key.shadow.mapSize.set(2048,2048); key.shadow.camera.near=20; key.shadow.camera.far=320;
+  key.shadow.camera.left=-90; key.shadow.camera.right=90; key.shadow.camera.top=90; key.shadow.camera.bottom=-90;
+  key.shadow.bias = -0.0004; scene.add(key);
+  var rim = new THREE.DirectionalLight(0xff86a6, .55); rim.position.set(-80, 40, -60); scene.add(rim);
+
+  function M(c,o){ o = o || {}; o.color = c; return new THREE.MeshStandardMaterial(o); }
+  var pcb=M(0x073d20,{roughness:.55,metalness:.14}), soc=M(0x0d0f13,{roughness:.42,metalness:.5}),
+      socLid=M(0x1a1d23,{roughness:.3,metalness:.82}), chip=M(0x15181e,{roughness:.5,metalness:.4}),
+      metal=M(0xc2c8d2,{roughness:.34,metalness:.95}), gold=M(0xd6a441,{roughness:.36,metalness:.95}),
+      plastic=M(0x0c0e12,{roughness:.7,metalness:.2}), blue=M(0x2f5bd0,{roughness:.45,metalness:.2}),
+      capm=M(0x23262d,{roughness:.5,metalness:.5});
+
+  var pi = new THREE.Group();
+  var TOP = 0.8;
+  function part(w,h,d, mat, x,y,z){
+    var m = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), mat);
+    m.position.set(x,y,z); m.castShadow = true; m.receiveShadow = true; pi.add(m); return m;
+  }
+  // board (85 x 56, 1.6 thick), centered
+  part(85, 1.6, 56, pcb, 0, 0, 0, true);
+  // silk hint strip + mounting pads
+  [[-38.5,-24.5],[38.5,-24.5],[-38.5,24.5],[38.5,24.5]].forEach(([x,z])=>{
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(2.4,0.7,8,20), gold);
+    ring.rotation.x = Math.PI/2; ring.position.set(x, TOP+0.05, z); ring.castShadow=true; pi.add(ring);
+    part(2.4,1.0,2.4, plastic, x, TOP+0.05, z);
+  });
+
+  // SoC (BCM2712) + lid
+  part(17,1.6,17, soc, -3, TOP+0.8, -2, true);
+  part(15,0.5,15, socLid, -3, TOP+1.6, -2, true);
+  // RAM + PMIC + small ICs
+  part(11,1.3,13, chip, 16, TOP+0.65, -3, true);
+  part(7,1.1,7, chip, -3, TOP+0.55, 17, true);
+  part(6,1.0,6, chip, 14, TOP+0.5, 16, true);
+  part(5,0.9,8, chip, 30, TOP+0.45, 17, true);
+  // RP1 southbridge
+  part(9,1.2,9, soc, 24, TOP+0.6, -19, true);
+
+  // capacitors / passives sprinkled
+  [[-22,8],[ -16,12],[8,-20],[20,8],[-30,-10],[34,-4]].forEach(([x,z])=>part(2.0,2.6,2.0, capm, x, TOP+1.3, z));
+
+  // GPIO 40-pin header on top long edge (+z)
+  part(52,3.0,5.2, plastic, 0, TOP+1.5, 23.5, true);
+  for(let c=0;c<20;c++){ const x=(c-9.5)*2.54;
+    [22.4, 24.6].forEach(z=> part(0.85,5.6,0.85, gold, x, TOP+3.2, z));
+  }
+
+  // right short edge (+x): two USB-A stacks + Ethernet (protruding past x=42.5)
+  part(15.5,14,16.6, metal, 46.5, TOP+7, 14, true);   // ethernet
+  part(13,15.5,17,   metal, 46.5, TOP+7.8, -2, true);  // USB stack
+  part(13,15.5,17,   metal, 46.5, TOP+7.8, -17, true); // USB stack
+  // blue USB3 inserts (front faces toward +x)
+  [-2,-17].forEach(z=>{ part(2,3,11, blue, 53.4, TOP+10.5, z); part(2,3,11, blue, 53.4, TOP+5, z); });
+
+  // front long edge (-z): USB-C power + 2 micro-HDMI (protruding past z=-28)
+  part(9,3.4,7, metal, -27, TOP+1.7, -29.5, true);  // USB-C
+  part(7.2,3,7, metal, -14, TOP+1.5, -29.5, true);  // HDMI0
+  part(7.2,3,7, metal, -4,  TOP+1.5, -29.5, true);  // HDMI1
+  part(4,2.4,6, plastic, 7, TOP+1.2, -29, true);    // 4-pole AV / antenna
+
+  // PCIe FPC connector (near -x edge)
+  part(3.2,2.6,22, plastic, -41.5, TOP+1.3, -2, true);
+  // power button + tiny LEDs
+  part(2.2,2.0,2.6, plastic, -41, TOP+1.0, 18, true);
+  part(1.6,0.8,1.6, M(0x39d98a,{emissive:0x1f6b46,emissiveIntensity:.6}), -39, TOP+0.6, 22);
+  part(1.6,0.8,1.6, M(0xe6486d,{emissive:0x7a2238,emissiveIntensity:.6}), -39, TOP+0.6, 25);
+  // fan header
+  for(let i=0;i<4;i++) part(0.7,2.2,0.7, gold, 12+i*1.3, TOP+1.4, -22);
+
+  pi.position.y = 2.5; scene.add(pi);
+
+  var ground = new THREE.Mesh(new THREE.PlaneGeometry(400,400), new THREE.ShadowMaterial({opacity:.34}));
+  ground.rotation.x = -Math.PI/2; ground.position.y = -1.4; ground.receiveShadow = true; scene.add(ground);
+
+  function resize(){
+    var r = canvas.parentElement.getBoundingClientRect();
+    if(!r.width || !r.height) return;
+    renderer.setSize(r.width, r.height, false);
+    camera.aspect = r.width / r.height; camera.updateProjectionMatrix();
+  }
+  resize(); window.addEventListener('resize', resize);
+
+  // ambient background: a slow continuous spin that speeds up while scrolling and fades as the hero leaves view
+  var hero = document.querySelector('.hero'), stage = canvas.parentElement;
+  var R = 130, yaw = 0.6, phi = 0.95, base = 0.0028, boost = 0, lastY = window.scrollY || 0, vis = 1;
+  function placeCam(){
+    camera.position.set(R*Math.sin(phi)*Math.sin(yaw), R*Math.cos(phi), R*Math.sin(phi)*Math.cos(yaw));
+    camera.lookAt(0, 3, 0);
+  }
+  function onScroll(){
+    var y = window.scrollY || 0;
+    boost += Math.min(0.05, Math.abs(y - lastY) * 0.0011); lastY = y;
+    var h = (hero && hero.offsetHeight) || window.innerHeight;
+    vis = Math.max(0, Math.min(1, 1 - y / (h * 0.78)));
+    stage.style.opacity = vis;
+  }
+  window.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+  function loop(){
+    requestAnimationFrame(loop);
+    boost *= 0.94;
+    if(vis <= 0.003) return;
+    yaw += base + boost;
+    placeCam(); renderer.render(scene, camera);
+  }
+  loop();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1627 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 8382c1d..38de024 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3599,6 +3599,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+ 
++    add_opt(common_arg(
++        {"--spec-tree-k"}, "N",
++        string_format("tree-draft: max draft hypotheses per slot, 1=linear/off (default: %d). MTP-only.", params.speculative.draft.n_tree_k),
++        [](common_params & params, int value) {
++            params.speculative.draft.n_tree_k = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TREE_K"));
++    add_opt(common_arg(
++        {"--spec-tree-p-max"}, "P",
++        string_format("tree-draft: branch when draft top-1 prob < this (default: %.2f)", (double)params.speculative.draft.tree_p_max),
++        [](common_params & params, const std::string & value) {
++            params.speculative.draft.tree_p_max = std::stof(value);
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TREE_P_MAX"));
+     add_opt(common_arg(
+         {"--spec-draft-p-split", "--draft-p-split"}, "P",
+         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
+diff --git a/common/common.cpp b/common/common.cpp
+index b01772e..84d7bc6 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1558,7 +1558,15 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     auto cparams = llama_context_default_params();
+ 
+     cparams.n_ctx             = params.n_ctx;
+-    cparams.n_seq_max         = params.n_parallel;
++    // tree-draft needs n_tree_k seq_ids per slot (branch hypotheses). At n_tree_k==1 this is a no-op.
++    cparams.n_seq_max         = params.n_parallel * std::max(1, params.speculative.draft.n_tree_k);
++    // BUG-5 guard: the context caps total sequences at LLAMA_MAX_SEQ (256). With tree-draft the effective ceiling
++    // on n_parallel is 256/n_tree_k; warn clearly here instead of letting llama_context construction throw opaquely.
++    if (cparams.n_seq_max > 256) {
++        LOG_WRN("%s: n_parallel(%d) * spec-tree-k(%d) = %u exceeds the max of 256 sequences; "
++                "reduce --parallel or --spec-tree-k (context construction will fail otherwise)\n",
++                __func__, params.n_parallel, std::max(1, params.speculative.draft.n_tree_k), cparams.n_seq_max);
++    }
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_batch           = params.n_batch;
+@@ -1584,7 +1592,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.no_perf           = params.no_perf;
+     cparams.op_offload        = !params.no_op_offload;
+     cparams.swa_full          = params.swa_full;
+-    cparams.kv_unified        = params.kv_unified;
++    // tree-draft forks the prefix KV across branch seqs via seq_cp, which is a cheap metadata copy
++    // ONLY in a unified KV cache (n_stream=1); it also keeps n_ctx_seq=n_ctx so the n_seq_max bump above
++    // does not shrink per-seq context. So force unified KV when branching is on (no-op at n_tree_k==1).
++    cparams.kv_unified        = params.kv_unified || params.speculative.draft.n_tree_k > 1;
+ 
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
+diff --git a/common/common.h b/common/common.h
+index 0b284cb..97e506a 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -306,6 +306,9 @@ struct common_params_speculative_draft {
+     float p_split = 0.1f; // speculative decoding split probability
+     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+ 
++    int32_t n_tree_k   = 1;     // tree-draft: max hypotheses per slot (1 = linear, no branching). MTP-only.
++    float   tree_p_max = 0.9f;  // branch when the draft top-1 prob is below this (an uncertain step)
++
+     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+ 
+     common_params_model mparams;
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index c537f33..7f6e6eb 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -11,6 +11,7 @@
+ #include <cctype>
+ #include <climits>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <unordered_map>
+ #include <vector>
+@@ -618,15 +619,52 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     return id;
+ }
+ 
++// EXPERIMENTAL lossy-acceptance lever (env-gated, default OFF = exact/lossless):
++//   LLAMA_SPEC_ACCEPT_TOPK=K  -> accept a draft token (not just the argmax) if it is within the
++//     target's top-K candidates AND its prob >= LLAMA_SPEC_ACCEPT_PRATIO * top1_prob.
++//   This trades exact-distribution matching (quality) for more accepted tokens/pass (speed). The
++//   accepted token still comes from the target's high-probability set, so quality loss is bounded.
++static int   spec_accept_topk()   { const char* e=getenv("LLAMA_SPEC_ACCEPT_TOPK");   return e?atoi(e):0; }
++static float spec_accept_pratio() { const char* e=getenv("LLAMA_SPEC_ACCEPT_PRATIO"); return e?atof(e):0.0f; }
++
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+ 
+     std::vector<llama_token> result;
+     result.reserve(idxs.size());
+ 
++    const int   acc_topk   = spec_accept_topk();
++    const float acc_pratio = spec_accept_pratio();
++
+     size_t i = 0;
+     for (; i < draft.size(); i++) {
+-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++        llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
++
++        // lossy top-K acceptance: if the draft token isn't the argmax but is a high-prob target
++        // candidate, accept the DRAFT token (override id) and keep extending the run.
++        // NOTE: read the RAW target logits at idxs[i] directly — the greedy sampler chain collapses
++        // gsmpl->cur_p to the argmax (and may not softmax it), so common_sampler_get_candidates() is
++        // useless here at temperature 0. The prob ratio p(draft)/p(top1) == exp(logit_draft - logit_max)
++        // (the softmax normalizer cancels), so we never need an explicit softmax.
++        if (acc_topk > 1 && draft[i] != id) {
++            const float * logits = llama_get_logits_ith(ctx, idxs[i]);
++            if (logits != nullptr) {
++                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++                if (draft[i] >= 0 && draft[i] < n_vocab) {
++                    const float draft_logit = logits[draft[i]];
++                    float max_logit = logits[0];
++                    int   rank = 0; // # tokens strictly more probable than the draft token
++                    for (int v = 0; v < n_vocab; ++v) {
++                        const float lv = logits[v];
++                        if (lv > max_logit)   { max_logit = lv; }
++                        if (lv > draft_logit) { ++rank; if (rank >= acc_topk) break; } // early out: not in top-K
++                    }
++                    if (rank < acc_topk && expf(draft_logit - max_logit) >= acc_pratio) {
++                        id = draft[i]; // accept the high-prob draft token instead of the argmax
++                    }
++                }
++            }
++        }
+ 
+         common_sampler_accept(gsmpl, id, true);
+ 
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d874315..18a3f0f 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -159,6 +159,9 @@ struct common_speculative_impl {
+ 
+     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+ 
++    // tree-draft: override the per-seq hidden state that seeds the next draft (no-op unless overridden)
++    virtual void set_pending_h(llama_seq_id /*seq_id*/, const float * /*h_nextn*/) {}
++
+     // true if this implementation requires the target context to extract post-norm embeddings
+     virtual bool need_embd() const = 0;
+ 
+@@ -969,14 +972,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+ 
+         for (int k = 0; k < n_tokens; ++k) {
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+-
+-                if (batch_in.seq_id[k][0] == seq_id) {
+-                    i_batch_end[seq_id] = k;
+-                    if (i_batch_beg[seq_id] < 0) {
+-                        i_batch_beg[seq_id] = k;
+-                    }
++            // tree-draft: a shared-prefix row carries multiple seq_ids (the slot seq + branch seqs).
++            // Branch seqs are >= n_seq (speculative, cleaned up after verify) so they fall outside this
++            // loop's range and are ignored here; the slot seq's [beg,end] range is unchanged vs linear MTP.
++            for (int s = 0; s < batch_in.n_seq_id[k]; ++s) {
++                const llama_seq_id sid = batch_in.seq_id[k][s];
++                if (sid < 0 || sid >= (llama_seq_id) n_seq) {
++                    continue;
++                }
++                i_batch_end[sid] = k;
++                if (i_batch_beg[sid] < 0) {
++                    i_batch_beg[sid] = k;
+                 }
+             }
+         }
+@@ -1068,6 +1074,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             drafting[seq_id] = true;
+             common_sampler_reset(smpls[seq_id].get());
+ 
++            // tree-draft: start each draft with empty branch output (draft() appends to it) and no divergence
++            dp.result_branch_at = -1;
++            if (dp.result_branch) {
++                dp.result_branch->clear();
++            }
++
+             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+ 
+             h_row = pending_h[seq_id].data();
+@@ -1082,6 +1094,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         int i = 0;
+ 
++        // tree-draft (n_tree_k>1, MTP/is_mem_shared only): record the FIRST low-confidence divergence per seq
++        // (top-2 seed + the diverging hidden row + a pre-step sampler snapshot). Two rows at the same (seq,pos)
++        // in ONE masked-draft batch are rejected by the decoder, so the branch is continued in a SEPARATE pass
++        // below. The branch reuses dp.n_past (masked draft writes no KV) so it cannot collide with the primary.
++        const bool tree_on = params.n_tree_k > 1 && is_mem_shared;
++        std::vector<bool>               div_found(n_seq, false);
++        std::vector<llama_token>        div_seed (n_seq, 0);
++        std::vector<std::vector<float>> div_h    (n_seq);
++        std::vector<common_sampler_ptr> div_smpl (n_seq);
++
+         while (n_drafting > 0) {
+             int i_batch = 0;
+ 
+@@ -1100,16 +1122,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+ 
+-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+-                }
+-
+-                // add drafted token for each sequence
+                 const llama_token id = cur_p->data[0].id;
+ 
+-                // only collect very high-confidence draft tokens
+                 if (cur_p->data[0].p < params.p_min) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+@@ -1117,26 +1131,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     continue;
+                 }
+ 
+-                common_sampler_accept(smpl, id, true);
+-
+                 auto & dp = dparams.at(seq_id);
+-                auto & result = *dp.result;
+ 
+-                result.push_back(id);
++                // record the FIRST low-confidence divergence (clone the sampler BEFORE accepting top-1).
++                if (tree_on && dp.result_branch != nullptr && !div_found[seq_id] &&
++                    cur_p->size >= 2 && cur_p->data[0].p < params.tree_p_max) {
++                    div_found[seq_id] = true;
++                    div_seed [seq_id] = cur_p->data[1].id;
++                    div_h    [seq_id].assign(h_row, h_row + n_embd);
++                    div_smpl [seq_id].reset(common_sampler_clone(smpl));
++                    common_sampler_accept(div_smpl[seq_id].get(), div_seed[seq_id], true);
++                    // divergence depth d = current primary length (result holds [0..d-1]; we are about to push result[d]).
++                    // result_branch[0] (= top-2) is the alternative to result[d], both drafted at position d.
++                    dp.result_branch_at = (int32_t) dp.result->size();
++                    dp.result_branch->push_back(div_seed[seq_id]);
++                }
+ 
+-                if (params.n_max <= (int) result.size()) {
++                common_sampler_accept(smpl, id, true);
++                dp.result->push_back(id);
++
++                if (params.n_max <= (int) dp.result->size()) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+                 }
+ 
+-                if (is_mem_shared) {
+-                    // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
+-                    // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
+-                    common_batch_add(batch, id, dp.n_past, { seq_id }, true);
+-                } else {
+-                    common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
+-                }
++                const llama_pos pos = is_mem_shared ? dp.n_past : dp.n_past + i + 1;
++                common_batch_add(batch, id, pos, { seq_id }, true);
+                 std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+             }
+ 
+@@ -1154,6 +1175,71 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             ++i;
+         }
+ 
++        // --- branch pass: continue each recorded top-2 hypothesis in its OWN decode stream ---
++        if (tree_on) {
++            common_batch_clear(batch);
++            std::vector<bool> balive(n_seq, false);
++            int n_balive = 0;
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (!div_found[seq_id]) {
++                    continue;
++                }
++                auto & dp = dparams[seq_id];
++                const llama_pos pos = is_mem_shared ? dp.n_past : dp.n_past + 1;
++                common_batch_add(batch, div_seed[seq_id], pos, { seq_id }, true);
++                std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), div_h[seq_id].data(), row_bytes);
++                balive[seq_id] = true;
++                n_balive++;
++            }
++
++            if (n_balive > 0 && llama_decode(ctx_dft, batch) == 0) {
++                int bi = 1; // seed was branch-depth 0
++                while (n_balive > 0) {
++                    int i_batch = 0;
++                    common_batch_clear(batch);
++                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                        if (!balive[seq_id]) {
++                            continue;
++                        }
++                        auto * bsmpl = div_smpl[seq_id].get();
++                        common_sampler_sample(bsmpl, ctx_dft, i_batch, true);
++                        h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
++                        ++i_batch;
++
++                        const auto * cur_p = common_sampler_get_candidates(bsmpl, true);
++                        const llama_token id = cur_p->data[0].id;
++
++                        if (cur_p->data[0].p < params.p_min) {
++                            balive[seq_id] = false;
++                            n_balive--;
++                            continue;
++                        }
++
++                        auto & dp = dparams[seq_id];
++                        common_sampler_accept(bsmpl, id, true);
++                        dp.result_branch->push_back(id);
++
++                        if (params.n_max <= (int) dp.result_branch->size()) {
++                            balive[seq_id] = false;
++                            n_balive--;
++                            continue;
++                        }
++
++                        const llama_pos pos = is_mem_shared ? dp.n_past : dp.n_past + bi + 1;
++                        common_batch_add(batch, id, pos, { seq_id }, true);
++                        std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
++                    }
++                    if (batch.n_tokens == 0) {
++                        break;
++                    }
++                    if (llama_decode(ctx_dft, batch) != 0) {
++                        break;
++                    }
++                    ++bi;
++                }
++            }
++        }
++
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+             if (!dp.drafting) {
+@@ -1183,6 +1269,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+     }
+ 
++    // tree-draft: when a branch hypothesis wins, the server overrides the next-draft seed with the branch's
++    // last-accepted nextn row (accept() above would otherwise have seeded it from the primary chain).
++    void set_pending_h(llama_seq_id seq_id, const float * h_nextn) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || h_nextn == nullptr) {
++            return;
++        }
++        std::memcpy(pending_h[seq_id].data(), h_nextn, (size_t) n_embd * sizeof(float));
++    }
++
+     bool need_embd() const override {
+         return false;
+     }
+@@ -2076,6 +2171,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+     }
+ }
+ 
++void common_speculative_set_pending_h(common_speculative * spec, llama_seq_id seq_id, const float * h_nextn) {
++    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
++        return;
++    }
++    common_speculative_impl * impl = spec->impl_last[seq_id];
++    if (impl != nullptr) {
++        impl->set_pending_h(seq_id, h_nextn);
++    }
++}
++
+ void common_speculative_print_stats(const common_speculative * spec) {
+     if (spec == nullptr) {
+         return;
+diff --git a/common/speculative.h b/common/speculative.h
+index bf76ad7..512e715 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -44,8 +44,16 @@ struct common_speculative_draft_params {
+     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
+     const llama_tokens * prompt;
+ 
+-    // the generated draft from the last _draft() call
++    // the generated draft from the last _draft() call (the primary / branch-0 chain)
+     llama_tokens * result;
++
++    // tree-draft (n_tree_k>1): the secondary hypothesis chain (top-2 continuation), or nullptr to disable.
++    // Left null at n_tree_k==1 -> draft() never branches -> byte-identical to linear MTP.
++    llama_tokens * result_branch = nullptr;
++
++    // tree-draft: divergence depth d. result_branch[0] is the top-2 alternative to result[d] (both drafted
++    // at the same position d). The shared prefix is result[0..d-1]. -1 when no branch was recorded this draft.
++    int32_t result_branch_at = -1;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+@@ -68,6 +76,11 @@ void common_speculative_draft(common_speculative * spec);
+ // informs the speculative context that n_accepted tokens were accepted by the target model
+ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+ 
++// tree-draft: override the hidden state that seeds the next draft for `seq_id` (used when a branch hypothesis
++// wins, so the next MTP draft is seeded from the branch's last-accepted row instead of the primary chain).
++// `h_nextn` must point to n_embd target nextn-embeddings. No-op for non-MTP implementations.
++void common_speculative_set_pending_h(common_speculative * spec, llama_seq_id seq_id, const float * h_nextn);
++
+ // print statistics about the speculative decoding
+ void common_speculative_print_stats(const common_speculative * spec);
+ 
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d..3879f9b 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -18,6 +18,7 @@ else()
+     add_subdirectory(debug)
+     add_subdirectory(embedding)
+     add_subdirectory(eval-callback)
++    add_subdirectory(ffn-sparsity)
+ 
+     add_subdirectory(gguf-hash)
+     add_subdirectory(gguf)
+diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
+index b0391a6..59bb0bc 100644
+--- a/ggml/src/ggml-cpu/arch-fallback.h
++++ b/ggml/src/ggml-cpu/arch-fallback.h
+@@ -42,6 +42,7 @@
+ #define ggml_gemv_q4_0_4x8_q8_0_generic ggml_gemv_q4_0_4x8_q8_0
+ #define ggml_gemv_q4_0_8x8_q8_0_generic ggml_gemv_q4_0_8x8_q8_0
+ #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
++#define ggml_gemv_q3_K_8x4_q8_K_generic ggml_gemv_q3_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x4_q8_K_generic ggml_gemv_q4_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x8_q8_K_generic ggml_gemv_q4_K_8x8_q8_K
+ #define ggml_gemv_q5_K_8x4_q8_K_generic ggml_gemv_q5_K_8x4_q8_K
+@@ -58,6 +59,7 @@
+ #define ggml_gemm_q4_0_4x8_q8_0_generic ggml_gemm_q4_0_4x8_q8_0
+ #define ggml_gemm_q4_0_8x8_q8_0_generic ggml_gemm_q4_0_8x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x4_q8_K_generic ggml_gemm_q4_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x8_q8_K_generic ggml_gemm_q4_K_8x8_q8_K
+ #define ggml_gemm_q5_K_8x4_q8_K_generic ggml_gemm_q5_K_8x4_q8_K
+@@ -77,13 +79,17 @@
+ #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
+ #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
+ #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
++// NOTE: ggml_gemv_q3_K_8x4_q8_K is hand-written in arch/arm/repack.cpp (NOT remapped to generic here).
+ #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
+ #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+ // quants.c
+ #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
+ // repack.cpp
++#define ggml_gemv_q3_K_8x4_q8_K_generic ggml_gemv_q3_K_8x4_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
+ #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
+ #define ggml_gemv_q4_0_4x4_q8_0_generic ggml_gemv_q4_0_4x4_q8_0
+@@ -126,6 +132,7 @@
+ #define ggml_gemv_q4_0_4x8_q8_0_generic ggml_gemv_q4_0_4x8_q8_0
+ #define ggml_gemv_q4_0_8x8_q8_0_generic ggml_gemv_q4_0_8x8_q8_0
+ #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
++#define ggml_gemv_q3_K_8x4_q8_K_generic ggml_gemv_q3_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x4_q8_K_generic ggml_gemv_q4_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x8_q8_K_generic ggml_gemv_q4_K_8x8_q8_K
+ #define ggml_gemv_q5_K_8x4_q8_K_generic ggml_gemv_q5_K_8x4_q8_K
+@@ -142,6 +149,7 @@
+ #define ggml_gemm_q4_0_4x8_q8_0_generic ggml_gemm_q4_0_4x8_q8_0
+ #define ggml_gemm_q4_0_8x8_q8_0_generic ggml_gemm_q4_0_8x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x4_q8_K_generic ggml_gemm_q4_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x8_q8_K_generic ggml_gemm_q4_K_8x8_q8_K
+ #define ggml_gemm_q5_K_8x4_q8_K_generic ggml_gemm_q5_K_8x4_q8_K
+@@ -172,6 +180,7 @@
+ #define ggml_gemv_q4_0_4x8_q8_0_generic ggml_gemv_q4_0_4x8_q8_0
+ #define ggml_gemv_q4_0_8x8_q8_0_generic ggml_gemv_q4_0_8x8_q8_0
+ #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
++#define ggml_gemv_q3_K_8x4_q8_K_generic ggml_gemv_q3_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x4_q8_K_generic ggml_gemv_q4_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x8_q8_K_generic ggml_gemv_q4_K_8x8_q8_K
+ #define ggml_gemv_q5_K_8x4_q8_K_generic ggml_gemv_q5_K_8x4_q8_K
+@@ -188,6 +197,7 @@
+ #define ggml_gemm_q4_0_4x8_q8_0_generic ggml_gemm_q4_0_4x8_q8_0
+ #define ggml_gemm_q4_0_8x8_q8_0_generic ggml_gemm_q4_0_8x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x4_q8_K_generic ggml_gemm_q4_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x8_q8_K_generic ggml_gemm_q4_K_8x8_q8_K
+ #define ggml_gemm_q5_K_8x4_q8_K_generic ggml_gemm_q5_K_8x4_q8_K
+@@ -212,6 +222,7 @@
+ #define ggml_gemv_q4_0_4x4_q8_0_generic ggml_gemv_q4_0_4x4_q8_0
+ #define ggml_gemv_q4_0_4x8_q8_0_generic ggml_gemv_q4_0_4x8_q8_0
+ #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
++#define ggml_gemv_q3_K_8x4_q8_K_generic ggml_gemv_q3_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x4_q8_K_generic ggml_gemv_q4_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x8_q8_K_generic ggml_gemv_q4_K_8x8_q8_K
+ #define ggml_gemv_q5_K_8x4_q8_K_generic ggml_gemv_q5_K_8x4_q8_K
+@@ -227,6 +238,7 @@
+ #define ggml_gemm_q4_0_4x4_q8_0_generic ggml_gemm_q4_0_4x4_q8_0
+ #define ggml_gemm_q4_0_4x8_q8_0_generic ggml_gemm_q4_0_4x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x4_q8_K_generic ggml_gemm_q4_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x8_q8_K_generic ggml_gemm_q4_K_8x8_q8_K
+ #define ggml_gemm_q5_K_8x4_q8_K_generic ggml_gemm_q5_K_8x4_q8_K
+@@ -263,6 +275,7 @@
+ #define ggml_gemv_q4_0_4x8_q8_0_generic ggml_gemv_q4_0_4x8_q8_0
+ #define ggml_gemv_q4_0_8x8_q8_0_generic ggml_gemv_q4_0_8x8_q8_0
+ #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
++#define ggml_gemv_q3_K_8x4_q8_K_generic ggml_gemv_q3_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x4_q8_K_generic ggml_gemv_q4_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x8_q8_K_generic ggml_gemv_q4_K_8x8_q8_K
+ #define ggml_gemv_q5_K_8x4_q8_K_generic ggml_gemv_q5_K_8x4_q8_K
+@@ -279,6 +292,7 @@
+ #define ggml_gemm_q4_0_4x8_q8_0_generic ggml_gemm_q4_0_4x8_q8_0
+ #define ggml_gemm_q4_0_8x8_q8_0_generic ggml_gemm_q4_0_8x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x4_q8_K_generic ggml_gemm_q4_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x8_q8_K_generic ggml_gemm_q4_K_8x8_q8_K
+ #define ggml_gemm_q5_K_8x4_q8_K_generic ggml_gemm_q5_K_8x4_q8_K
+@@ -317,6 +331,7 @@
+ #define ggml_gemv_q4_0_4x8_q8_0_generic ggml_gemv_q4_0_4x8_q8_0
+ #define ggml_gemv_q4_0_8x8_q8_0_generic ggml_gemv_q4_0_8x8_q8_0
+ #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
++#define ggml_gemv_q3_K_8x4_q8_K_generic ggml_gemv_q3_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x4_q8_K_generic ggml_gemv_q4_K_8x4_q8_K
+ #define ggml_gemv_q4_K_8x8_q8_K_generic ggml_gemv_q4_K_8x8_q8_K
+ #define ggml_gemv_q5_K_8x4_q8_K_generic ggml_gemv_q5_K_8x4_q8_K
+@@ -333,6 +348,7 @@
+ #define ggml_gemm_q4_0_4x8_q8_0_generic ggml_gemm_q4_0_4x8_q8_0
+ #define ggml_gemm_q4_0_8x8_q8_0_generic ggml_gemm_q4_0_8x8_q8_0
+ #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
++#define ggml_gemm_q3_K_8x4_q8_K_generic ggml_gemm_q3_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x4_q8_K_generic ggml_gemm_q4_K_8x4_q8_K
+ #define ggml_gemm_q4_K_8x8_q8_K_generic ggml_gemm_q4_K_8x8_q8_K
+ #define ggml_gemm_q5_K_8x4_q8_K_generic ggml_gemm_q5_K_8x4_q8_K
+diff --git a/ggml/src/ggml-cpu/arch/arm/repack.cpp b/ggml/src/ggml-cpu/arch/arm/repack.cpp
+index a753444..7754a35 100644
+--- a/ggml/src/ggml-cpu/arch/arm/repack.cpp
++++ b/ggml/src/ggml-cpu/arch/arm/repack.cpp
+@@ -1306,6 +1306,105 @@ void ggml_gemv_q5_K_8x8_q8_K(int                        n,
+     ggml_gemv_q5_K_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++// Hand-written NEON+dotprod q3_K repacked gemv (8 cols, blocklen=4). BW-bound on Cortex-A76 (llvm-mca
++// ~497 cyc/superblock). Identity: q3_K weight = (3-bit value 0..7) - 4 -> dot the unsigned value, subtract
++// the 4*Σ scale*bsum bias (q8 bsums). Scales are pre-unpacked SIGNED & interleaved at repack time.
++// Bit-exact vs ggml_vec_dot_q3_K_q8_K (validated under qemu-aarch64, kernels/q3neon.c, 0/9600).
++void ggml_gemv_q3_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
++    const int qk = QK_K;
++    const int nb = n / qk;
++    constexpr int ncols_interleaved = 8;
++
++    assert(n % qk == 0);
++    assert(nc % ncols_interleaved == 0);
++
++    UNUSED(bs);
++    UNUSED(nr);
++
++#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++    // qgroup table {qbyte0, hbyte0, base_bit, sb_base}; for shift index s: sb=sb_base+2s, shift=2s, bit=base_bit+s
++    static const int QG[4][4] = { {0, 0, 0, 0}, {16, 16, 0, 1}, {32, 0, 4, 8}, {48, 16, 4, 9} };
++    const uint8x16_t m3 = vdupq_n_u8(3), m1 = vdupq_n_u8(1);
++
++    const block_q8_K * GGML_RESTRICT q8_ptr = (const block_q8_K *) vy;
++    for (int x = 0; x < nc / ncols_interleaved; x++) {
++        const block_q3_Kx8 * GGML_RESTRICT b_ptr = (const block_q3_Kx8 *) vx + (x * nb);
++        float32x4_t acc_f32[2] = { vdupq_n_f32(0), vdupq_n_f32(0) };
++        for (int bb = 0; bb < nb; bb++) {
++            // unpack the 8 columns' packed 6-bit scales -> SIGNED int8 scbuf[sb*8+col] (= sc-32). Scalar;
++            // overlaps the NEON work on an out-of-order core (separate integer pipes).
++            int8_t scbuf[16 * 8];
++            {
++                const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
++                for (int col = 0; col < 8; col++) {
++                    uint32_t auxs[4];
++                    memcpy(auxs, b_ptr[bb].scales + col * 12, 12);
++                    uint32_t tmp = auxs[2];
++                    auxs[2] = ((auxs[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
++                    auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
++                    auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
++                    auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
++                    const int8_t * s8 = (const int8_t *) auxs;
++                    for (int sb = 0; sb < 16; sb++) scbuf[sb * 8 + col] = (int8_t) (s8[sb] - 32);
++                }
++            }
++            float32x4_t q8d = vdupq_n_f32(q8_ptr[bb].d);
++            float32x4_t d0  = vmulq_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) b_ptr[bb].d)),     q8d);
++            float32x4_t d1  = vmulq_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) b_ptr[bb].d + 4)), q8d);
++            int32x4_t acc[2] = { vdupq_n_s32(0), vdupq_n_s32(0) };
++
++            // bias[col] = 4 * Σ_sb scale[sb][col] * bsum[sb]  (handles the constant -4 weight offset)
++            int32x4_t bias_lo = vdupq_n_s32(0), bias_hi = vdupq_n_s32(0);
++            for (int sb = 0; sb < 16; sb++) {
++                int16x8_t sc = vmovl_s8(vld1_s8(scbuf + sb * 8));
++                int16_t   bsm = q8_ptr[bb].bsums[sb];
++                bias_lo = vmlal_n_s16(bias_lo, vget_low_s16(sc),  bsm);
++                bias_hi = vmlal_n_s16(bias_hi, vget_high_s16(sc), bsm);
++            }
++            bias_lo = vshlq_n_s32(bias_lo, 2);
++            bias_hi = vshlq_n_s32(bias_hi, 2);
++
++            for (int qg = 0; qg < 4; qg++) {
++                const int qbyte0 = QG[qg][0], hbyte0 = QG[qg][1], base_bit = QG[qg][2], sb_base = QG[qg][3];
++                for (int g = 0; g < 2; g++) {
++                    int32x4_t sbacc[4] = { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) };
++                    for (int q = 0; q < 4; q++) {
++                        uint8x16_t qsv = vld1q_u8(b_ptr[bb].qs    + ((qbyte0 / 4 + q) * 8 + 4 * g) * 4);
++                        uint8x16_t hmv = vld1q_u8(b_ptr[bb].hmask + ((hbyte0 / 4 + q) * 8 + 4 * g) * 4);
++                        uint8x16_t hb  = vshlq_u8(hmv, vdupq_n_s8(-(int8_t) base_bit)); // bits -> positions 0..3
++                        const int8_t * q8b = q8_ptr[bb].qs + 4 * q;
++#define Q3_DEQDOT(S, SH, HBV) do { \
++            uint8x16_t lo = vandq_u8(vshrq_n_u8(qsv, (SH)), m3); \
++            int8x16_t w = vreinterpretq_s8_u8(vsliq_n_u8(lo, vandq_u8((HBV), m1), 2)); \
++            int8x16_t q8v = (int8x16_t) vld1q_dup_s32((const int32_t *) (q8b + (sb_base + 2 * (S)) * 16)); \
++            sbacc[(S)] = vdotq_s32(sbacc[(S)], w, q8v); \
++        } while (0)
++                        Q3_DEQDOT(0, 0, hb);
++                        Q3_DEQDOT(1, 2, vshrq_n_u8(hb, 1));
++                        Q3_DEQDOT(2, 4, vshrq_n_u8(hb, 2));
++                        Q3_DEQDOT(3, 6, vshrq_n_u8(hb, 3));
++#undef Q3_DEQDOT
++                    }
++                    for (int s2 = 0; s2 < 4; s2++) {
++                        const int sb = sb_base + 2 * s2;
++                        int32x4_t scv = vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(scbuf + sb * 8 + 4 * g))));
++                        acc[g] = vmlaq_s32(acc[g], sbacc[s2], scv);
++                    }
++                }
++            }
++            acc[0] = vsubq_s32(acc[0], bias_lo);
++            acc[1] = vsubq_s32(acc[1], bias_hi);
++            acc_f32[0] = vaddq_f32(acc_f32[0], vmulq_f32(vcvtq_f32_s32(acc[0]), d0));
++            acc_f32[1] = vaddq_f32(acc_f32[1], vmulq_f32(vcvtq_f32_s32(acc[1]), d1));
++        }
++        vst1q_f32(s + x * ncols_interleaved,     acc_f32[0]);
++        vst1q_f32(s + x * ncols_interleaved + 4, acc_f32[1]);
++    }
++    return;
++#endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++    ggml_gemv_q3_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
++}
++
+ void ggml_gemv_q6_K_8x4_q8_K(int                        n,
+                              float * GGML_RESTRICT      s,
+                              size_t                     bs,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index eb8341c..01afa42 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3015,6 +3015,48 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// ---- per-op-type profiling (env GGML_OP_PROFILE=1), thread-0 wall time between barriers ----
++static int64_t g_opprof_us[GGML_OP_COUNT];
++static int64_t g_opprof_cnt[GGML_OP_COUNT];
++static int64_t g_opprof_mulmat_q[2];   // [0]=us [1]=count for MUL_MAT with quantized src0 (weight matmul)
++static int64_t g_opprof_fused_us;
++static int64_t g_opprof_fused_cnt;
++static int     g_opprof_enabled = -1;
++static int64_t g_opprof_ncompute = 0;
++static int64_t g_opprof_skip = 0;
++
++void ggml_opprof_dump(void) {
++    if (g_opprof_enabled != 1) return;
++    int64_t total = 0;
++    for (int i = 0; i < GGML_OP_COUNT; i++) total += g_opprof_us[i];
++    total += g_opprof_fused_us;
++    fprintf(stderr, "\n==== GGML OP PROFILE (thread-0 wall, us) over %lld graph-computes (after skipping %lld) ====\n",
++            (long long)(g_opprof_ncompute - g_opprof_skip), (long long)g_opprof_skip);
++    fprintf(stderr, "%-22s %12s %10s %8s\n", "op", "us", "count", "%%");
++    // print MUL_MAT split out
++    for (int i = 0; i < GGML_OP_COUNT; i++) {
++        if (g_opprof_cnt[i] == 0) continue;
++        if (i == GGML_OP_MUL_MAT) {
++            int64_t q_us = g_opprof_mulmat_q[0], q_cnt = g_opprof_mulmat_q[1];
++            int64_t f_us = g_opprof_us[i] - q_us, f_cnt = g_opprof_cnt[i] - q_cnt;
++            fprintf(stderr, "%-22s %12lld %10lld %7.2f\n", "MUL_MAT(weight/q)", (long long)q_us, (long long)q_cnt, total? 100.0*q_us/total:0);
++            fprintf(stderr, "%-22s %12lld %10lld %7.2f\n", "MUL_MAT(f32/other)", (long long)f_us, (long long)f_cnt, total? 100.0*f_us/total:0);
++            continue;
++        }
++        fprintf(stderr, "%-22s %12lld %10lld %7.2f\n", ggml_op_name((enum ggml_op)i),
++                (long long)g_opprof_us[i], (long long)g_opprof_cnt[i], total? 100.0*g_opprof_us[i]/total:0);
++    }
++    if (g_opprof_fused_cnt) {
++        fprintf(stderr, "%-22s %12lld %10lld %7.2f\n", "RMS_NORM_MUL(fused)",
++                (long long)g_opprof_fused_us, (long long)g_opprof_fused_cnt, total? 100.0*g_opprof_fused_us/total:0);
++    }
++    fprintf(stderr, "%-22s %12lld\n", "TOTAL", (long long)total);
++    memset(g_opprof_us, 0, sizeof(g_opprof_us));
++    memset(g_opprof_cnt, 0, sizeof(g_opprof_cnt));
++    g_opprof_mulmat_q[0] = g_opprof_mulmat_q[1] = 0;
++    g_opprof_fused_us = g_opprof_fused_cnt = 0;
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3055,6 +3097,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        if (state->ith == 0 && g_opprof_enabled == -1) {
++            const char * e = getenv("GGML_OP_PROFILE");
++            g_opprof_enabled = (e && e[0] == '1') ? 1 : 0;
++            const char * s = getenv("GGML_OP_PROFILE_SKIP");
++            g_opprof_skip = s ? atoll(s) : 0;
++            if (g_opprof_enabled == 1) atexit(ggml_opprof_dump);
++        }
++        if (state->ith == 0 && node_n == 0) g_opprof_ncompute++;
++        const int prof = (state->ith == 0 && g_opprof_enabled == 1 &&
++                          g_opprof_ncompute > g_opprof_skip);
++        const int64_t t0 = prof ? ggml_time_us() : 0;
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3073,6 +3127,22 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++
++        if (prof) {
++            const int64_t dt = ggml_time_us() - t0;
++            if (n_fused > 0) {
++                g_opprof_fused_us  += dt;
++                g_opprof_fused_cnt += 1;
++            } else {
++                g_opprof_us[node->op]  += dt;
++                g_opprof_cnt[node->op] += 1;
++                if (node->op == GGML_OP_MUL_MAT && node->src[0] &&
++                    ggml_is_quantized(node->src[0]->type)) {
++                    g_opprof_mulmat_q[0] += dt;
++                    g_opprof_mulmat_q[1] += 1;
++                }
++            }
++        }
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 74611dc..9cf2c6b 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -3051,32 +3051,38 @@ static void ggml_compute_forward_geglu_f32(
+ 
+     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+ 
+-    // rows per thread
+-    const int dr = (nr + nth - 1)/nth;
+-
+-    // row range for this thread
+-    const int ir0 = dr*ith;
+-    const int ir1 = MIN(ir0 + dr, nr);
+-
+-    for (int i1 = ir0; i1 < ir1; i1++) {
+-        float * src0_p = (float *) (src0_d + i1*src0_o);
+-        float * src1_p = (float *) (src1_d + i1*src1_o);
+-
+-        if (!src1) {
+-            src0_p += swapped ? nc : 0;
+-            src1_p += swapped ? 0 : nc;
++    if (nr >= nth) {
++        // enough rows: split work by rows (each thread does full nc for its rows)
++        const int dr = (nr + nth - 1)/nth;
++        const int ir0 = dr*ith;
++        const int ir1 = MIN(ir0 + dr, nr);
++        for (int i1 = ir0; i1 < ir1; i1++) {
++            float * src0_p = (float *) (src0_d + i1*src0_o);
++            float * src1_p = (float *) (src1_d + i1*src1_o);
++            if (!src1) {
++                src0_p += swapped ? nc : 0;
++                src1_p += swapped ? 0 : nc;
++            }
++            ggml_vec_geglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+         }
+-
+-        ggml_vec_geglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+-
+-#ifndef NDEBUG
+-        for (int k = 0; k < nc; k++) {
+-            const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+-            GGML_UNUSED(x);
+-            assert(!isnan(x));
+-            assert(!isinf(x));
++    } else {
++        // few rows (e.g. M=1 decode): split the nc columns across threads so all cores work
++        const int dc  = (nc + nth - 1)/nth;
++        const int ic0 = dc*ith;
++        const int ic1 = MIN(ic0 + dc, nc);
++        const int nci = ic1 - ic0;
++        if (nci > 0) {
++            for (int i1 = 0; i1 < nr; i1++) {
++                float * src0_p = (float *) (src0_d + i1*src0_o);
++                float * src1_p = (float *) (src1_d + i1*src1_o);
++                if (!src1) {
++                    src0_p += swapped ? nc : 0;
++                    src1_p += swapped ? 0 : nc;
++                }
++                ggml_vec_geglu_f32(nci, (float *) ((char *) dst->data + i1*(dst->nb[1])) + ic0,
++                                   src0_p + ic0, src1_p + ic0);
++            }
+         }
+-#endif // NDEBUG
+     }
+ }
+ 
+@@ -7922,6 +7928,39 @@ static void ggml_compute_forward_pad_f32(
+     const int32_t lp3 = ggml_get_op_params_i32(dst, 6);
+     const int32_t rp3 = ggml_get_op_params_i32(dst, 7);
+ 
++    // Fast path: dim0 not padded + src dim0 contiguous (the common case -- e.g. the 256K-vocab logits pad run
++    // on EVERY forward). Then each output row along ne0 is a whole contiguous memcpy (in-bounds row) or memset-0
++    // (a padded row), instead of the scalar per-element 4-way-bounds-checked copy below. Parallelize over the
++    // ne0 axis (not the often-tiny row axis) so threads stay balanced. Value-identical (bit-exact) to the scalar.
++    if constexpr (!circular_t) {
++        if (lp0 == 0 && rp0 == 0 && nb00 == sizeof(float)) {
++            const int64_t dr   = (ne0 + nth - 1)/nth;
++            const int64_t i0_0 = dr*ith;
++            const int64_t i0_1 = MIN(i0_0 + dr, ne0);
++            const int64_t span = i0_1 - i0_0;
++            if (span > 0) {
++                for (int64_t i3 = 0; i3 < ne3; ++i3) {
++                    const bool in3 = (i3 >= lp3 && i3 < ne3 - rp3);
++                    for (int64_t i2 = 0; i2 < ne2; ++i2) {
++                        const bool in2 = (i2 >= lp2 && i2 < ne2 - rp2);
++                        for (int64_t i1 = 0; i1 < ne1; ++i1) {
++                            const bool in1 = (i1 >= lp1 && i1 < ne1 - rp1);
++                            float * d = dst_ptr + i3*(ne0*ne1*ne2) + i2*(ne0*ne1) + i1*ne0 + i0_0;
++                            if (in1 && in2 && in3) {
++                                const char * s = (const char *) src0->data
++                                    + (i3 - lp3)*nb03 + (i2 - lp2)*nb02 + (i1 - lp1)*nb01 + i0_0*nb00;
++                                memcpy(d, s, (size_t) span * sizeof(float));
++                            } else {
++                                memset(d, 0, (size_t) span * sizeof(float));
++                            }
++                        }
++                    }
++                }
++            }
++            return;
++        }
++    }
++
+     // TODO: optimize
+ 
+     for (int64_t i2 = 0; i2 < ne2; ++i2) {
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index f18758f..70e7203 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -1102,6 +1102,91 @@ void ggml_gemv_q2_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
+     }
+ }
+ 
++// q3_K repacked gemv (8 columns interleaved). Reconstructs the 3-bit weights (qs low-2 + hmask high-1)
++// and 6-bit scales for each column into a canonical aux8[256] buffer, then dots against the q8_K
++// activation in natural position order -- bit-exact vs ggml_vec_dot_q3_K_q8_K (validated, kernels/q3rep2.c).
++// generic (portable) q3_K repacked gemv -- blocklen=4 layout, SIGNED pre-unpacked interleaved scales.
++// Correctness fallback for the hand NEON kernel (arch/arm/repack.cpp). Reconstructs the signed weight
++// ((qs>>shift)&3) - (hbit?0:4) at canonical position p, dots against q8 at natural position p.
++void ggml_gemv_q3_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
++    const int qk = QK_K;
++    const int nb = n / qk;
++    const int ncols_interleaved = 8;
++    const int blocklen = 4;
++
++    assert (n % qk == 0);
++    assert (nc % ncols_interleaved == 0);
++
++    UNUSED(s);
++    UNUSED(bs);
++    UNUSED(vx);
++    UNUSED(vy);
++    UNUSED(nr);
++    UNUSED(nc);
++    UNUSED(nb);
++    UNUSED(ncols_interleaved);
++    UNUSED(blocklen);
++
++    int8_t aux8[QK_K];
++
++    const block_q8_K * a_ptr = (const block_q8_K *) vy;
++    for (int x = 0; x < nc / ncols_interleaved; x++) {
++        const block_q3_Kx8 * b_ptr = (const block_q3_Kx8 *) vx + (x * nb);
++        for (int j = 0; j < ncols_interleaved; j++) {
++            float sumf = 0.0f;
++            for (int l = 0; l < nb; l++) {
++                // --- dequantize column j into aux8[256] (canonical q3_K order; blocklen=4 interleave) ---
++                uint8_t m = 1;
++                int wi = 0;
++                int qbase = 0;
++                for (int nn = 0; nn < QK_K; nn += 128) {
++                    int shift = 0;
++                    for (int jj = 0; jj < 4; jj++) {
++                        for (int t = 0; t < 16; t++) {
++                            const int pq = qbase + t;
++                            const uint8_t q = b_ptr[l].qs[((pq / 4) * 8 + j) * 4 + (pq % 4)];
++                            const uint8_t h = b_ptr[l].hmask[((t / 4) * 8 + j) * 4 + (t % 4)];
++                            aux8[wi + t] = (int8_t) (((q >> shift) & 3) - ((h & m) ? 0 : 4));
++                        }
++                        for (int t = 0; t < 16; t++) {
++                            const int pq = qbase + 16 + t;
++                            const int ph = 16 + t;
++                            const uint8_t q = b_ptr[l].qs[((pq / 4) * 8 + j) * 4 + (pq % 4)];
++                            const uint8_t h = b_ptr[l].hmask[((ph / 4) * 8 + j) * 4 + (ph % 4)];
++                            aux8[wi + 16 + t] = (int8_t) (((q >> shift) & 3) - ((h & m) ? 0 : 4));
++                        }
++                        wi += 32; shift += 2; m <<= 1;
++                    }
++                    qbase += 32;
++                }
++                // --- unpack column j's 16 packed 6-bit scales (kmask trick) ---
++                int8_t scales[16];
++                {
++                    const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
++                    uint32_t auxs[4];
++                    memcpy(auxs, b_ptr[l].scales + j * 12, 12);
++                    uint32_t tmp = auxs[2];
++                    auxs[2] = ((auxs[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
++                    auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
++                    auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
++                    auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
++                    const int8_t * s8 = (const int8_t *) auxs;
++                    for (int t = 0; t < 16; t++) scales[t] = s8[t];
++                }
++                // --- scaled dot: per-16 int8*int8 reduction (auto-vectorizes to SDOT) ---
++                int isum = 0;
++                for (int sb = 0; sb < 16; sb++) {
++                    int dot = 0;
++                    for (int t = 0; t < 16; t++) dot += aux8[sb * 16 + t] * (int) a_ptr[l].qs[sb * 16 + t];
++                    isum += (scales[sb] - 32) * dot;
++                }
++                sumf += (float) isum * (GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * a_ptr[l].d);
++            }
++            s[x * ncols_interleaved + j] = sumf;
++        }
++    }
++}
++
+ void ggml_gemv_q5_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+     ggml_gemv_q5_K_NxM_q8_K_generic_impl<4, 8>(n, s, bs, vx, vy, nr, nc);
+ }
+@@ -2073,6 +2158,102 @@ void ggml_gemm_q2_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
+     }
+ }
+ 
++// q3_K repacked gemm (M=4 rows x 8 columns). Same per-column dequant as the gemv; pairs the
++// dequantized weight at canonical position p with the interleaved q8_Kx4 activation for row m at
++// index 32*(p/8) + 8*m + (p%8). Bit-exact vs ggml_vec_dot_q3_K_q8_K (validated, kernels/q3rep2.c).
++void ggml_gemm_q3_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
++    const int qk = QK_K;
++    const int nb = n / qk;
++    const int ncols_interleaved = 8;
++    const int blocklen = 8;
++
++    assert (n % qk == 0);
++    assert (nr % 4 == 0);
++    assert (nc % ncols_interleaved == 0);
++
++    UNUSED(s);
++    UNUSED(bs);
++    UNUSED(vx);
++    UNUSED(vy);
++    UNUSED(nr);
++    UNUSED(nc);
++    UNUSED(nb);
++    UNUSED(ncols_interleaved);
++    UNUSED(blocklen);
++
++    int8_t aux8[QK_K];
++
++    for (int y = 0; y < nr / 4; y++) {
++        const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + (y * nb);
++        for (int x = 0; x < nc / ncols_interleaved; x++) {
++            const block_q3_Kx8 * b_ptr = (const block_q3_Kx8 *) vx + (x * nb);
++            for (int j = 0; j < ncols_interleaved; j++) {
++                float sumf[4];
++                for (int mm = 0; mm < 4; mm++) sumf[mm] = 0.0f;
++                for (int l = 0; l < nb; l++) {
++                    // --- dequantize column j into aux8[256] (canonical q3_K order; blocklen=4 interleave) ---
++                    uint8_t m = 1;
++                    int wi = 0;
++                    int qbase = 0;
++                    for (int nn = 0; nn < QK_K; nn += 128) {
++                        int shift = 0;
++                        for (int jj = 0; jj < 4; jj++) {
++                            for (int t = 0; t < 16; t++) {
++                                const int pq = qbase + t;
++                                const uint8_t q = b_ptr[l].qs[((pq / 4) * 8 + j) * 4 + (pq % 4)];
++                                const uint8_t h = b_ptr[l].hmask[((t / 4) * 8 + j) * 4 + (t % 4)];
++                                aux8[wi + t] = (int8_t) (((q >> shift) & 3) - ((h & m) ? 0 : 4));
++                            }
++                            for (int t = 0; t < 16; t++) {
++                                const int pq = qbase + 16 + t;
++                                const int ph = 16 + t;
++                                const uint8_t q = b_ptr[l].qs[((pq / 4) * 8 + j) * 4 + (pq % 4)];
++                                const uint8_t h = b_ptr[l].hmask[((ph / 4) * 8 + j) * 4 + (ph % 4)];
++                                aux8[wi + 16 + t] = (int8_t) (((q >> shift) & 3) - ((h & m) ? 0 : 4));
++                            }
++                            wi += 32; shift += 2; m <<= 1;
++                        }
++                        qbase += 32;
++                    }
++                    // --- unpack column j's 16 packed 6-bit scales (kmask trick) ---
++                    int8_t scales[16];
++                    {
++                        const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
++                        uint32_t auxs[4];
++                        memcpy(auxs, b_ptr[l].scales + j * 12, 12);
++                        uint32_t tmp = auxs[2];
++                        auxs[2] = ((auxs[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
++                        auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
++                        auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
++                        auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
++                        const int8_t * s8 = (const int8_t *) auxs;
++                        for (int t = 0; t < 16; t++) scales[t] = s8[t];
++                    }
++                    // --- scaled dot vs each of the 4 activation rows. INTER_SIZE=4 -> the activation is
++                    //     q8_K_4x4-interleaved, so a 4-element chunk maps to 4 contiguous lanes:
++                    //     idx = 16*(p/4) + 4*mm + (p%4). ---
++                    for (int mm = 0; mm < 4; mm++) {
++                        int isum = 0;
++                        for (int sb = 0; sb < 16; sb++) {
++                            int dot = 0;
++                            for (int chunk = 0; chunk < 4; chunk++) {
++                                const int p0   = sb * 16 + chunk * 4;
++                                const int idx0 = 16 * (p0 / 4) + 4 * mm;  // 4 contiguous lanes
++                                for (int t = 0; t < 4; t++) dot += aux8[p0 + t] * (int) a_ptr[l].qs[idx0 + t];
++                            }
++                            isum += (scales[sb] - 32) * dot;
++                        }
++                        sumf[mm] += (float) isum * (GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * a_ptr[l].d[mm]);
++                    }
++                }
++                for (int mm = 0; mm < 4; mm++) {
++                    s[(y * 4 + mm) * bs + x * ncols_interleaved + j] = sumf[mm];
++                }
++            }
++        }
++    }
++}
++
+ void ggml_gemm_q5_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+     ggml_gemm_q5_K_NxM_q8_K_generic_impl<4, 8>(n, s, bs, vx, vy, nr, nc);
+ }
+@@ -3004,6 +3185,43 @@ static block_q2_Kx8 make_block_q2_Kx8(block_q2_K * in, unsigned int blck_size_in
+     return out;
+ }
+ 
++static block_q3_Kx8 make_block_q3_Kx8(block_q3_K * in, unsigned int blck_size_interleave) {
++    block_q3_Kx8 out;
++
++    // super-block scales of the eight Q3_K structures are copied onto the output interleaved structure
++    for (int i = 0; i < 8; i++) {
++        out.d[i] = in[i].d;
++    }
++
++    // Interleave the low-2-bit quants (qs) by taking blck_size_interleave bytes at a time, round-robin
++    // over the 8 source blocks (same scheme as Q2_K / Q5_K so the gemv index math lines up).
++    const int qs_end = (QK_K / 4) * 8 / blck_size_interleave;
++    for (int i = 0; i < qs_end; i++) {
++        int src_id     = i % 8;
++        int src_offset = (i / 8) * blck_size_interleave;
++        int dst_offset = i * blck_size_interleave;
++        memcpy(&out.qs[dst_offset], &in[src_id].qs[src_offset], blck_size_interleave);
++    }
++
++    // Interleave the high-bit plane (hmask) with the same chunked round-robin.
++    const int hmask_end = (QK_K / 8) * 8 / blck_size_interleave;
++    for (int i = 0; i < hmask_end; i++) {
++        int src_id     = i % 8;
++        int src_offset = (i / 8) * blck_size_interleave;
++        int dst_offset = i * blck_size_interleave;
++        memcpy(&out.hmask[dst_offset], &in[src_id].hmask[src_offset], blck_size_interleave);
++    }
++
++    // Store the 12-byte packed 6-bit scales contiguously per column (12 bytes/col). Kept packed so the
++    // repacked block fits 8*sizeof(block_q3_K)=880B; unpacked on the fly in the gemv/gemm/hand kernel.
++    for (int j = 0; j < 8; j++) {
++        for (int t = 0; t < 12; t++) {
++            out.scales[j * 12 + t] = in[j].scales[t];
++        }
++    }
++    return out;
++}
++
+ static block_q5_Kx8 make_block_q5_Kx8(block_q5_K * in, unsigned int blck_size_interleave) {
+     block_q5_Kx8 out;
+     //Delta(scale) and dmin values of the eight Q5_K structures are copied onto the output interleaved structure
+@@ -3320,6 +3538,37 @@ static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block
+     GGML_UNUSED(data_size);
+ }
+ 
++static int repack_q3_K_to_q3_K_8_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
++    GGML_ASSERT(t->type == GGML_TYPE_Q3_K);
++    GGML_ASSERT(interleave_block == 4);
++    constexpr int nrows_interleaved = 8;
++
++    block_q3_Kx8 * dst = (block_q3_Kx8*)t->data;
++    const block_q3_K * src = (const block_q3_K*) data;
++    block_q3_K dst_tmp[8];
++    int nrow = ggml_nrows(t);
++    int nblocks = t->ne[0] / QK_K;
++
++    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_q3_K));
++
++    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % 8 != 0) {
++        return -1;
++    }
++
++    for (int b = 0; b < nrow; b += nrows_interleaved) {
++        for (int64_t x = 0; x < nblocks; x++) {
++            for (int i = 0; i < nrows_interleaved; i++) {
++                dst_tmp[i] = src[x + i * nblocks];
++            }
++            *dst++ = make_block_q3_Kx8(dst_tmp, interleave_block);
++        }
++        src += nrows_interleaved * nblocks;
++    }
++    return 0;
++
++    GGML_UNUSED(data_size);
++}
++
+ static int repack_q2_K_to_q2_K_16_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
+     GGML_ASSERT(t->type == GGML_TYPE_Q2_K);
+     constexpr int nrows_interleaved = 16;
+@@ -3889,6 +4138,10 @@ template <> int repack<block_q2_K, 8, 8>(struct ggml_tensor * t, const void * da
+     return repack_q2_K_to_q2_K_8_bl(t, 8, data, data_size);
+ }
+ 
++template <> int repack<block_q3_K, 4, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
++    return repack_q3_K_to_q3_K_8_bl(t, 4, data, data_size);
++}
++
+ template <> int repack<block_q5_K, 4, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+     return repack_q5_K_to_q5_K_8_bl(t, 4, data, data_size);
+ }
+@@ -3983,6 +4236,17 @@ void gemv<block_q2_K, 8, 8, GGML_TYPE_Q8_K>(int          n,
+     ggml_gemv_q2_K_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++template <>
++void gemv<block_q3_K, 4, 8, GGML_TYPE_Q8_K>(int          n,
++                                            float *      s,
++                                            size_t       bs,
++                                            const void * vx,
++                                            const void * vy,
++                                            int          nr,
++                                            int          nc) {
++    ggml_gemv_q3_K_8x4_q8_K(n, s, bs, vx, vy, nr, nc);
++}
++
+ template <> void gemv<block_q4_K, 4, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+     ggml_gemv_q4_K_8x4_q8_K(n, s, bs, vx, vy, nr, nc);
+ }
+@@ -4080,6 +4344,10 @@ template <> void gemm<block_q2_K, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t
+     ggml_gemm_q2_K_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++template <> void gemm<block_q3_K, 4, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
++    ggml_gemm_q3_K_8x4_q8_K(n, s, bs, vx, vy, nr, nc);
++}
++
+ template <> void gemm<block_q4_K, 4, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+     ggml_gemm_q4_K_8x4_q8_K(n, s, bs, vx, vy, nr, nc);
+ }
+@@ -4546,6 +4814,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+     // instance for Q2
+     static const ggml::cpu::repack::tensor_traits<block_q2_K, 8, 8, GGML_TYPE_Q8_K> q2_K_8x8_q8_K;
+ 
++    // instance for Q3
++    static const ggml::cpu::repack::tensor_traits<block_q3_K, 4, 8, GGML_TYPE_Q8_K> q3_K_8x4_q8_K;
++
+     // instance for IQ4
+     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0> iq4_nl_4x4_q8_0;
+     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0> iq4_nl_8x8_q8_0;
+@@ -4641,6 +4912,22 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+             }
+             #endif
+         }
++    } else if (cur->type == GGML_TYPE_Q3_K) {
++        // ARM + dotprod: the hand-written ggml_gemv_q3_K_8x4_q8_K (arch/arm/repack.cpp) is BW-bound
++        // (llvm-mca: ~497 cyc/superblock) -> the real win, enabled by default.
++        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
++            if (cur->ne[1] % 8 == 0) {
++                return &q3_K_8x4_q8_K;
++            }
++        }
++        // Other arches have only the portable-C generic, which is correct+lossless but slower than the
++        // hand-tuned per-row vec_dot -> off by default (no regression). GGML_Q3K_REPACK=1 forces it on
++        // (e.g. to validate the repack/layout end-to-end on x86).
++        if (getenv("GGML_Q3K_REPACK") != NULL) {
++            if (cur->ne[1] % 8 == 0) {
++                return &q3_K_8x4_q8_K;
++            }
++        }
+     } else if (cur->type == GGML_TYPE_Q5_K) {
+         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
+             if (cur->ne[1] % 8 == 0) {
+diff --git a/ggml/src/ggml-cpu/repack.h b/ggml/src/ggml-cpu/repack.h
+index cb21edf..020e585 100644
+--- a/ggml/src/ggml-cpu/repack.h
++++ b/ggml/src/ggml-cpu/repack.h
+@@ -72,6 +72,15 @@ struct block_q2_Kx16 {
+ };
+ static_assert(sizeof(block_q2_Kx16) == sizeof(ggml_half) * 32 + QK_K + QK_K * 4, "wrong q2_K block size/padding");
+ 
++struct block_q3_Kx8 {
++    ggml_half d[8];               // super-block scale
++    uint8_t   hmask[QK_K / 8 * 8]; // quants - high bit  (32 bytes/col, blocklen=4 interleave)
++    uint8_t   qs[QK_K / 4 * 8];    // quants - low 2 bits (64 bytes/col, blocklen=4 interleave)
++    uint8_t   scales[12 * 8];      // scales, 6-bit packed (12 bytes/col). MUST stay packed: the repacked
++                                   // block must fit 8*sizeof(block_q3_K)=880B; unpacked (128B) would overflow.
++};
++static_assert(sizeof(block_q3_Kx8) == sizeof(ggml_half) * 8 + QK_K / 8 * 8 + QK_K / 4 * 8 + 12 * 8, "wrong q3_K block size/padding");
++
+ struct block_q5_Kx8 {
+     ggml_half d[8];              // super-block scale for quantized scales
+     ggml_half dmin[8];           // super-block scale for quantized mins
+@@ -145,6 +154,7 @@ void ggml_gemv_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+ void ggml_gemv_q4_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemv_q3_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q5_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+@@ -161,6 +171,7 @@ void ggml_gemm_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+ void ggml_gemm_q4_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemm_q3_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q4_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q5_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+@@ -197,6 +208,7 @@ void ggml_gemv_q4_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+ void ggml_gemv_q4_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q2_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemv_q3_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q4_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemv_q5_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+@@ -213,6 +225,7 @@ void ggml_gemm_q4_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
+ void ggml_gemm_q4_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q4_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q2_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
++void ggml_gemm_q3_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q4_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q4_K_8x8_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+ void ggml_gemm_q5_K_8x4_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index 67b6b05..325fc40 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -252,6 +252,25 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t *
+         }
+         GGML_F32x4_REDUCE_4(sumf, sum[0], sum[1], sum[2], sum[3]);
+     }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    // Cortex-A76 has no BF16 dot extension, so the scalar tail below was the only path here. Mirror the AVX2
++    // path (per-element f32 multiply, then add into f32 accumulators) with NEON: same arithmetic, vectorized.
++    // bf16->f32 is exact -- widen each 16-bit value into the high half of a 32-bit lane (== value << 16) and
++    // reinterpret as f32. Reduction order matches the AVX2 path ((c0+c2)+(c1+c3)).
++    float32x4_t c0 = vdupq_n_f32(0.0f);
++    float32x4_t c1 = vdupq_n_f32(0.0f);
++    float32x4_t c2 = vdupq_n_f32(0.0f);
++    float32x4_t c3 = vdupq_n_f32(0.0f);
++#define GGML_BF16X4_TO_F32(p) vreinterpretq_f32_u32(vshll_n_u16(vld1_u16((const uint16_t *)(p)), 16))
++    for (; i + 16 <= n; i += 16) {
++        c0 = vaddq_f32(c0, vmulq_f32(GGML_BF16X4_TO_F32(x + i),      GGML_BF16X4_TO_F32(y + i)));
++        c1 = vaddq_f32(c1, vmulq_f32(GGML_BF16X4_TO_F32(x + i + 4),  GGML_BF16X4_TO_F32(y + i + 4)));
++        c2 = vaddq_f32(c2, vmulq_f32(GGML_BF16X4_TO_F32(x + i + 8),  GGML_BF16X4_TO_F32(y + i + 8)));
++        c3 = vaddq_f32(c3, vmulq_f32(GGML_BF16X4_TO_F32(x + i + 12), GGML_BF16X4_TO_F32(y + i + 12)));
++    }
++#undef GGML_BF16X4_TO_F32
++    c0 = vaddq_f32(vaddq_f32(c0, c2), vaddq_f32(c1, c3));
++    sumf += (ggml_float)vaddvq_f32(c0);
+ #endif
+ 
+     for (; i < n; ++i) {
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 5de9cb5..1103712 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -906,7 +906,25 @@ inline static void ggml_vec_step_f16 (const int n, ggml_fp16_t * y, const ggml_f
+         y[i] = GGML_CPU_FP32_TO_FP16((GGML_CPU_FP16_TO_FP32(x[i]) > 0.f) ? 1.f : 0.f);
+     }
+ }
+-inline static void ggml_vec_tanh_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = tanhf(x[i]);  }
++#if defined(__ARM_NEON) && defined(__aarch64__)
++inline static float32x4_t ggml_v_expf(float32x4_t x);   // defined below; reused for a vectorized tanh
++#endif
++inline static void ggml_vec_tanh_f32 (const int n, float * y, const float * x) {
++    int i = 0;
++#if defined(__ARM_NEON) && defined(__aarch64__)
++    // A76 had only scalar tanhf here. Gemma applies final-logit softcap = c*tanh(logits/c) over the whole
++    // 256K vocab every verify position, so this is a real per-pass cost. tanh(x) = 1 - 2/(exp(2x)+1) via the
++    // accurate NEON expf helper. tanh is MONOTONIC, so the softcap never changes the argmax -> generated tokens
++    // are identical (distribution-exact); only returned logprobs shift by the expf approx (~1 ulp).
++    const float32x4_t one = vdupq_n_f32(1.0f);
++    const float32x4_t two = vdupq_n_f32(2.0f);
++    for (; i + 4 <= n; i += 4) {
++        const float32x4_t e = ggml_v_expf(vmulq_f32(vld1q_f32(x + i), two));  // exp(2x); saturates to +inf -> tanh=1
++        vst1q_f32(y + i, vsubq_f32(one, vdivq_f32(two, vaddq_f32(e, one))));
++    }
++#endif
++    for (; i < n; ++i) y[i] = tanhf(x[i]);
++}
+ inline static void ggml_vec_tanh_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+     for (int i = 0; i < n; ++i) {
+         y[i] = GGML_CPU_FP32_TO_FP16(tanhf(GGML_CPU_FP16_TO_FP32(x[i])));
+@@ -986,6 +1004,9 @@ inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggm
+ 
+ #ifdef GGML_GELU_FP16
+ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
++    // NOTE (A76): tried a NEON tanh-approx here to replace this scalar f16-table gather; it REGRESSED ~9%
++    // (vdivq_f32 + the expf poly are ~3x slower than a gather that hits the hot 128KB table in L1/L2). The LUT
++    // is the right design on this core -- kept. (See the bf16 dot kernel in vec.cpp for the change that did win.)
+     uint16_t t;
+     for (int i = 0; i < n; ++i) {
+         if (x[i] <= -10.0f) {
+@@ -1413,6 +1434,7 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
+ 
+ #ifdef GGML_GELU_FP16
+ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
++    // NOTE (A76): see ggml_vec_gelu_f32 -- a NEON gelu here also regressed; the f16-table gather wins. Kept scalar.
+     uint16_t t;
+     for (int i = 0; i < n; ++i) {
+         if (x[i] <= -10.0f) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 986b2f1..93bbe5b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -87,10 +87,18 @@ struct server_slot {
+     common_speculative * spec;
+ 
+     llama_tokens spec_draft;
++    llama_tokens spec_draft_branch;         // tree-draft (n_tree_k>1): the secondary top-2 hypothesis chain
+     llama_tokens spec_prompt;
+     std::vector<int32_t> spec_i_batch;
++    std::vector<int32_t> spec_i_batch_branch; // batch indices for the branch chain's verify
+     common_prompt_checkpoint spec_ckpt;
+ 
++    // tree-draft (n_tree_k>1) config + state
++    int32_t n_tree_k     = 1;   // number of hypotheses verified per pass (1 == linear MTP, no branching)
++    int32_t n_parallel   = 1;   // server n_parallel; branch seq for hypothesis b (1..k-1) is b*n_parallel + id
++    int32_t spec_branch_at = -1; // divergence depth d: spec_draft_branch[0] forks from spec_draft[d] (same pos)
++    llama_pos spec_pos0  = 0;   // KV position of the sampled token `s` in the verify batch (fork base)
++
+     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
+     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
+     std::unique_ptr<const server_task> task;
+@@ -178,6 +186,12 @@ struct server_slot {
+         if (ctx_dft) {
+             common_context_seq_rm(ctx_dft, id, -1, -1);
+         }
++        // tree-draft BUG-2 fix: also reclaim this slot's branch seqs. The verify-block cleanup only runs on a
++        // SUCCESSFUL decode reaching the verify path; a decode error (or any teardown) reaches prompt_clear, so
++        // without this the forked bseq cells leak for the slot's lifetime (and defeat KV-full recovery).
++        for (int b = 1; b < n_tree_k; ++b) {
++            common_context_seq_rm(ctx_tgt, b * n_parallel + id, -1, -1);
++        }
+ 
+         prompt.tokens.clear();
+     }
+@@ -223,7 +237,10 @@ struct server_slot {
+ 
+         if (can_speculate()) {
+             spec_draft.clear();
++            spec_draft_branch.clear();
+             spec_i_batch.clear();
++            spec_i_batch_branch.clear();
++            spec_branch_at = -1;
+             spec_ckpt.clear();
+         }
+         generated_tokens.clear();
+@@ -376,17 +393,74 @@ struct server_slot {
+                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
+ 
+             GGML_ASSERT(spec_i_batch.empty());
++            GGML_ASSERT(spec_i_batch_branch.empty());
+ 
+-            spec_i_batch.push_back(batch.n_tokens);
+-            for (size_t i = 0; i < spec_draft.size(); i++) {
+-                spec_i_batch.push_back(batch.n_tokens + i + 1);
+-            }
++            const auto pos0 = prompt.tokens.pos_next();
++
++            // tree-draft is active only when draft() recorded a usable divergence for this slot
++            const bool tree_on =
++                n_tree_k > 1 &&
++                !spec_draft_branch.empty() &&
++                spec_branch_at >= 0 &&
++                spec_branch_at < (int) spec_draft.size();
++
++            if (!tree_on) {
++                // ---- linear MTP verify (UNCHANGED): sampled `s` then the primary draft, all on seq=id ----
++                spec_branch_at = -1; // make sure the verify path does not treat this as a tree pass
++
++                spec_i_batch.push_back(batch.n_tokens);
++                for (size_t i = 0; i < spec_draft.size(); i++) {
++                    spec_i_batch.push_back(batch.n_tokens + i + 1);
++                }
+ 
+-            auto pos0 = prompt.tokens.pos_next();
++                auto pos = pos0;
++                common_batch_add(batch, sampled, pos++, { this->id }, true);
++                for (auto token : spec_draft) {
++                    common_batch_add(batch, token, pos++, { this->id }, true);
++                }
++            } else {
++                // ---- tree verify: two hypotheses share prefix [s, P_0..P_{d-1}], then fork at depth d ----
++                //   primary P_d..P_{n-1}  -> seq = id          (positions pos0+1+d ..)
++                //   branch  B_0..B_{p-1}  -> seq = bseq        (SAME positions pos0+1+d .., different seq)
++                // both verified in this single target decode -> more candidate tokens per weight read.
++                const int          d    = spec_branch_at;
++                const llama_seq_id bseq = 1 * n_parallel + this->id; // hypothesis b=1 (k==2: the only branch)
++
++                spec_pos0 = pos0; // remember the fork base so the verify step can place seq_rm/seq_cp
++
++                // fork the committed prefix [0, pos0) into the branch seq so its rows attend to the full context.
++                // seq_rm first = clean slate (drops any stale branch KV from a prior pass). With kv_unified
++                // (forced when n_tree_k>1) seq_cp is a cheap metadata cell-bitset op, not a tensor copy.
++                common_context_seq_rm(ctx_tgt, bseq, -1, -1);
++                common_context_seq_cp(ctx_tgt, this->id, bseq, 0, pos0);
++
++                // 1) sampled token `s` at pos0 — shared by both hypotheses (one row, both seqs)
++                int idx = batch.n_tokens;
++                common_batch_add(batch, sampled, pos0, { this->id, bseq }, true);
++                spec_i_batch.push_back(idx);
++                spec_i_batch_branch.push_back(idx);
++
++                // 2) shared prefix P_0..P_{d-1} at pos0+1 .. pos0+d — one row each, both seqs
++                for (int j = 0; j < d; j++) {
++                    idx = batch.n_tokens;
++                    common_batch_add(batch, spec_draft[j], pos0 + 1 + j, { this->id, bseq }, true);
++                    spec_i_batch.push_back(idx);
++                    spec_i_batch_branch.push_back(idx);
++                }
+ 
+-            common_batch_add(batch, sampled, pos0++, { this->id }, true);
+-            for (auto token : spec_draft) {
+-                common_batch_add(batch, token, pos0++, { this->id }, true);
++                // 3) primary tail P_d..P_{n-1} at pos0+1+d .. — seq=id only
++                for (int j = d; j < (int) spec_draft.size(); j++) {
++                    idx = batch.n_tokens;
++                    common_batch_add(batch, spec_draft[j], pos0 + 1 + j, { this->id }, true);
++                    spec_i_batch.push_back(idx);
++                }
++
++                // 4) branch tail B_0..B_{p-1} at pos0+1+d .. — seq=bseq only (same positions as primary tail)
++                for (int j = 0; j < (int) spec_draft_branch.size(); j++) {
++                    idx = batch.n_tokens;
++                    common_batch_add(batch, spec_draft_branch[j], pos0 + 1 + d + j, { bseq }, true);
++                    spec_i_batch_branch.push_back(idx);
++                }
+             }
+         }
+ 
+@@ -1172,6 +1246,10 @@ private:
+             slot.spec    = spec.get();
+             slot.n_ctx   = n_ctx_slot;
+ 
++            // tree-draft config (n_tree_k>1 verifies k hypotheses per target pass via seq-forked branches)
++            slot.n_parallel = params_base.n_parallel;
++            slot.n_tree_k   = std::max(1, params_base.speculative.draft.n_tree_k);
++
+             slot.mctx                   = mctx;
+             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+ 
+@@ -1206,7 +1284,17 @@ private:
+         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+         {
+             const int32_t n_batch = llama_n_batch(ctx_tgt);
+-            batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
++            // tree-draft: a shared-prefix row belongs to the slot seq + up to (n_tree_k-1) branch seqs,
++            // so each batch token must allow up to n_tree_k seq_ids.
++            const int32_t n_seq_per_tok = std::max(1, params_base.speculative.draft.n_tree_k);
++            // tree-draft BUG-3 fix: each branching slot appends 1 + n(primary) + p(branch) rows (<= 1 + 2*n_max);
++            // size the token capacity so a full set of parallel branching slots can never overflow common_batch_add.
++            int32_t n_batch_tok = std::max(n_batch, params_base.n_parallel);
++            if (n_seq_per_tok > 1) {
++                const int32_t per_slot = 1 + n_seq_per_tok * (std::max(1, params_base.speculative.draft.n_max) + 1);
++                n_batch_tok = std::max(n_batch_tok, params_base.n_parallel * per_slot);
++            }
++            batch = llama_batch_init(n_batch_tok, 0, n_seq_per_tok);
+         }
+ 
+         if (params_base.cache_ram_mib != 0) {
+@@ -2633,6 +2721,7 @@ private:
+                             /* .id_last  = */ slot.sampled,
+                             /* .prompt   = */ &slot.spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
++                            /* .result_branch = */ &slot.spec_draft_branch, // draft() only writes it when n_tree_k>1
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -2655,6 +2744,28 @@ private:
+ 
+             slot.n_draft_total += draft.size();
+ 
++            // tree-draft: read back the divergence depth recorded by draft() (==-1 when no branch was taken)
++            const auto & dp_rb  = common_speculative_get_draft_params(spec.get(), slot.id);
++            slot.spec_branch_at = dp_rb.result_branch_at;
++
++            // tree-draft BUG-1 fix: clamp the branch hypothesis to the slot's remaining context budget. The verify
++            // batch occupies pos0 + 1 + n(primary) + p(branch) distinct unified-KV cells (primary tail and branch
++            // tail are separate cells at overlapping positions). draft() only bounds the branch by the static
++            // params.n_max, so near end-of-context the branch tail can overflow n_ctx and abort the whole request.
++            // Require n + p <= dp.n_max (1 cell headroom); drop the branch entirely if there is no room.
++            if (slot.spec_branch_at >= 0 && !slot.spec_draft_branch.empty()) {
++                // BUG-4 fix: the branch can only be COMMITTED when the target context supports partial seq_rm
++                // (the verify-side commit requires it). On any other context, drop the branch here so update_batch
++                // takes the linear path and we don't waste a fork+decode on rows the verify will discard.
++                const int budget = (dp_rb.n_max > 0 ? dp_rb.n_max : (int) draft.size()) - (int) draft.size();
++                if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART || budget <= 0) {
++                    slot.spec_draft_branch.clear();
++                    slot.spec_branch_at = -1;
++                } else if ((int) slot.spec_draft_branch.size() > budget) {
++                    slot.spec_draft_branch.resize(budget);
++                }
++            }
++
+             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+ 
+@@ -3531,13 +3642,78 @@ private:
+                     // save the sampler sampler state in case we need to restore it
+                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+ 
++                    // tree-draft: a branch hypothesis is verifiable this pass only if draft() recorded a divergence
++                    // AND the context supports partial seq_rm/seq_cp (PART) for the winner-commit graft.
++                    const bool tree_active =
++                        slot.n_tree_k > 1 &&
++                        slot.spec_branch_at >= 0 &&
++                        !slot.spec_i_batch_branch.empty() &&
++                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART;
++
++                    // clone the PRE-verify sampler so the branch is verified from the same state as the primary
++                    common_sampler_ptr branch_smpl;
++                    if (tree_active) {
++                        branch_smpl.reset(common_sampler_clone(slot.smpl.get()));
++                    }
++
+                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                     slot.spec_i_batch.clear();
+ 
++                    // tree-draft: verify the branch hypothesis in the SAME target pass; adopt it if it ran further.
++                    // Every committed token is still the in-batch target argmax (sample_and_accept_n only accepts
++                    // argmax matches) -> the branch can only EXTEND how many target-greedy tokens we capture per pass.
++                    size_t        n_draft_winner = slot.spec_draft.size();
++                    const float * branch_won_h   = nullptr;
++                    if (tree_active) {
++                        const int d = slot.spec_branch_at;
++
++                        // branch hypothesis tokens after `s`: shared prefix P[0..d-1] ++ branch tail B[0..p-1]
++                        llama_tokens branch_draft;
++                        branch_draft.reserve((size_t) d + slot.spec_draft_branch.size());
++                        branch_draft.insert(branch_draft.end(), slot.spec_draft.begin(), slot.spec_draft.begin() + d);
++                        branch_draft.insert(branch_draft.end(), slot.spec_draft_branch.begin(), slot.spec_draft_branch.end());
++
++                        GGML_ASSERT(slot.spec_i_batch_branch.size() == branch_draft.size() + 1);
++                        auto accepted_branch = common_sampler_sample_and_accept_n(
++                                branch_smpl.get(), slot.ctx_tgt, slot.spec_i_batch_branch, branch_draft);
++
++                        const size_t n_acc_p = accepted.size()        - 1;
++                        const size_t n_acc_b = accepted_branch.size() - 1;
++
++                        if (n_acc_b > n_acc_p) {
++                            // BRANCH WINS: rewrite slot.id KV past the fork to the branch's accepted cells.
++                            const llama_seq_id bseq  = 1 * slot.n_parallel + slot.id;
++                            const llama_pos    posB  = slot.spec_pos0 + 1 + d;   // first divergent KV position
++                            const int          n_div = (int) n_acc_b - d;        // accepted BRANCH tail tokens (>=1)
++
++                            common_context_seq_rm(slot.ctx_tgt, slot.id, posB, -1);               // drop primary tail
++                            common_context_seq_cp(slot.ctx_tgt, bseq, slot.id, posB, posB + n_div); // graft branch tail
++
++                            // seed the next draft from the branch's last-accepted nextn row (not the primary chain).
++                            // valid after the cleanup seq_rm below: nextn embeddings live in the output buffer, not KV.
++                            branch_won_h = llama_get_embeddings_nextn_ith(slot.ctx_tgt, slot.spec_i_batch_branch[n_acc_b]);
++
++                            slot.smpl      = std::move(branch_smpl);
++                            accepted       = std::move(accepted_branch);
++                            n_draft_winner = branch_draft.size();
++                        }
++                    }
++
++                    // tree-draft: branch verify done -> drop this pass's branch state + branch KV (clean slate for the
++                    // next update_batch). A branch win's committed cells were already grafted into slot.id above.
++                    if (slot.n_tree_k > 1) {
++                        slot.spec_i_batch_branch.clear();
++                        slot.spec_draft_branch.clear();
++                        slot.spec_branch_at = -1;
++                        for (int b = 1; b < slot.n_tree_k; ++b) {
++                            common_context_seq_rm(slot.ctx_tgt, b * slot.n_parallel + slot.id, -1, -1);
++                        }
++                    }
++
+                     GGML_ASSERT(accepted.size() >= 1);
+ 
+-                    const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
++                    const uint32_t n_rollback = n_draft_winner + 1 - accepted.size();
+ 
+                     const bool use_ckpt_tgt =
+                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+@@ -3582,6 +3758,12 @@ private:
+ 
+                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+ 
++                    // tree-draft: if a branch won, accept() seeded the next draft from the primary chain -> override
++                    // it with the branch's last-accepted nextn row so the following draft starts from the right state.
++                    if (branch_won_h != nullptr) {
++                        common_speculative_set_pending_h(spec.get(), slot.id, branch_won_h);
++                    }
++
+                     slot.spec_draft = std::move(accepted);
+                 }
+ 
